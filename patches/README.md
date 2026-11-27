@@ -17,6 +17,7 @@ unless its switch is set; the release build is unchanged.
 | 0009 | `0009-own-capture-secs-raw.patch` | captures in a wall-clock window; raw rows | `VICTORY_CAPTURE_SECS=<a>-<b>`, `VICTORY_CAPTURE_RAW=1` | `crates/victory-gpu/src/capture.rs` | own | GPL-3.0 |
 | 0010 | `0010-own-capture-scene.patch` | captures after every start of a cutscene; `cap [<n>]` | `VICTORY_CAPTURE_SCENE=0x<name>:<a>-<b>` | `crates/victory-gpu/src/{capture.rs, debugcmd.rs}`, `crates/victory-loader/src/natives.rs` | own | GPL-3.0 |
 | 0011 | `0011-own-capture-headless.patch` | captures without a swap chain | - | `crates/victory-gpu/src/host.rs` | own | GPL-3.0 |
+| 0012 | `0012-own-checkpoint.patch` | `checkpoint`: jump to a stage of the running mission; stage announcements in the channel's log | - (needs `VICTORY_NATIVES` and `MISSION_STAGE_SET` in the names file) | `crates/victory-gpu/src/{checkpoint.rs (new), debugcmd.rs, lib.rs}`, `crates/victory-loader/src/natives.rs` | own | GPL-3.0 |
 
 Made against inkVI v0.2.1 (victory-fork `4c6046614` + inkVI's 38 patches). It uses inkVI's `hooks::write` (made
 `pub(crate)` by 0002), `iterate::world_frame` and the presenting thread's hook point next to `shot::present`.

@@ -1,0 +1,978 @@
+From 27f04ea26d848936f5d17c07aabd20e17f8e5fec Mon Sep 17 00:00:00 2001
+From: Octo <180629317+OctoAlgo@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 23:56:56 +0100
+Subject: [PATCH] checkpoint: jump to a stage of the running mission; stage
+ announcements in the channel log
+
+`checkpoint list` prints the known stages and the current one; `checkpoint <stage>` finds the
+stage field fresh, writes the stage, makes the mission fail once with a far teleport and waits
+for the title's own retry, which restarts the mission at that stage. The hook notes the native
+the title announces stages with (MISSION_STAGE_SET), and the channel logs every change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Kit-Source: own (inkVI-dive, checkpoints)
+Kit-Licence: GPL-3.0
+---
+ crates/victory-gpu/src/checkpoint.rs | 687 +++++++++++++++++++++++++++
+ crates/victory-gpu/src/debugcmd.rs   |  98 +++-
+ crates/victory-gpu/src/lib.rs        |   3 +
+ crates/victory-loader/src/natives.rs |  66 +++
+ 4 files changed, 852 insertions(+), 2 deletions(-)
+ create mode 100644 crates/victory-gpu/src/checkpoint.rs
+
+diff --git a/crates/victory-gpu/src/checkpoint.rs b/crates/victory-gpu/src/checkpoint.rs
+new file mode 100644
+index 0000000..ed015c0
+--- /dev/null
++++ b/crates/victory-gpu/src/checkpoint.rs
+@@ -0,0 +1,687 @@
++//! LOCAL (octo, inkVI-dive): `checkpoint`, a test tool that jumps to a stage
++//! (checkpoint) of the mission that is running, for the diagnostics build's
++//! debug channel.
++//!
++//! How (build 1.0.2.1, Chapter 1 opening; the inkVI-dive docs/checkpoints.md):
++//!  * the running mission's current stage is kept as `{stage hash: u32, 1: u32}`
++//!    in a field of a long-lived script object (its +0x70). Its address
++//!    differs between builds of the layer (other heap layout), so it is found
++//!    fresh for every jump: every 8-byte-aligned word `{known stage, 1}` in
++//!    writable memory, then only the holders whose next 4-byte word (+8) is 1
++//!    too, that are not part of a run of holders 18h apart (the script VM's
++//!    stacks), not on our own stack, and that still hold a stage about two
++//!    seconds later. Exactly one must be left, or nothing is written;
++//!  * the jump writes `{target, 1}` there and makes the mission fail once with
++//!    a far teleport (300 m west by default: the Chapter 1 mission fails by
++//!    distance between 200 and 300 m). The title's own retry then restarts
++//!    the mission at the stage in that field, with its own scenes, clock and
++//!    placement;
++//!  * the title announces every stage change, and the retry, through one
++//!    native (`MISSION_STAGE_SET` in the names file: (stage, restart flag));
++//!    the hook notes those calls (`victory_loader::natives::stage_events_after`)
++//!    and the channel logs them, so testers can record stages of other
++//!    missions.
++//!
++//! A teleport right after a retry once crashed the title inside its own
++//! teleport: no teleport is made while the clock stands still (a retry or a
++//! stage loading), and none after the retry.
++
++use crate::debugcmd::Memory;
++
++/// A stage of a mission we know.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct Stage {
++    pub hash: u32,
++    /// Short and neutral: chapter and stage number.
++    pub label: &'static str,
++    /// Where it starts, without story.
++    pub what: &'static str,
++}
++
++/// The stages known so far (build 1.0.2.1): the Chapter 1 opening mission (its script `0x72e73a29`), in order.
++pub(crate) const KNOWN: [Stage; 4] = [
++    Stage { hash: 0x489b_8c77, label: "ch1-s1", what: "the mission's first stage (opening cutscene)" },
++    Stage { hash: 0x3382_4f3b, label: "ch1-s2", what: "from the montage" },
++    Stage { hash: 0x7bf0_9c68, label: "ch1-s3", what: "boat gameplay at the dock" },
++    Stage { hash: 0x8cf1_71f3, label: "ch1-s4", what: "in the boat on the river (control returned)" },
++];
++
++pub(crate) fn label(hash: u32) -> Option<&'static str> {
++    KNOWN.iter().find(|s| s.hash == hash).map(|s| s.label)
++}
++
++/// `ch1-s3 (0x7bf09c68)` or `0x12345678 (no label)`.
++pub(crate) fn name(hash: u32) -> String {
++    match label(hash) {
++        Some(l) => format!("{l} ({hash:#010x})"),
++        None => format!("{hash:#010x} (no label)"),
++    }
++}
++
++/// A stage given as a label (`ch1-s2`) or a hash (`0x33824f3b`).
++pub(crate) fn parse_stage(word: &str) -> Result<u32, String> {
++    if let Some(s) = KNOWN.iter().find(|s| s.label.eq_ignore_ascii_case(word)) {
++        return Ok(s.hash);
++    }
++    let h = word.strip_prefix("0x").or_else(|| word.strip_prefix("0X")).ok_or_else(|| format!("no stage {word} (checkpoint list)"))?;
++    u32::from_str_radix(h, 16).ok().filter(|v| *v != 0).ok_or_else(|| format!("bad stage hash {word}"))
++}
++
++/// An 8-byte-aligned word `{stage, 1}`; `next` = the 4-byte word after it (+8), if readable.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct Holder {
++    pub at: usize,
++    pub stage: u32,
++    pub next: Option<u32>,
++}
++
++/// Holders found at most (the rest is not looked at).
++const HOLDERS_MAX: usize = 4096;
++/// The script VM's stacks keep values in slots 18h apart: such runs are not the field.
++pub(crate) const STACK_STRIDE: usize = 0x18;
++
++/// Every 8-byte-aligned `{stage, 1}` with `stage` in `stages`, in the process's writable memory (the image too).
++/// The comparison is on the two halves, so the list of stages in our own memory does not look like a holder.
++pub(crate) fn holders<M: Memory>(mem: &M, stages: &[u32]) -> Vec<Holder> {
++    let mut found = Vec::new();
++    for r in mem.regions() {
++        let mut at = r.base;
++        let end = r.base + r.size;
++        while at < end && found.len() < HOLDERS_MAX {
++            let len = (end - at).min(64 << 20);
++            if let Some(b) = mem.read(at, len) {
++                let skip = at.wrapping_neg() & 7;
++                let words = &b[skip.min(b.len())..];
++                for (i, c) in words.chunks_exact(8).enumerate() {
++                    if c[4..8] != [1, 0, 0, 0] {
++                        continue;
++                    }
++                    let stage = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
++                    if !stages.contains(&stage) {
++                        continue;
++                    }
++                    let off = skip + i * 8;
++                    let next = match b.get(off + 8..off + 12) {
++                        Some(n) => Some(u32::from_le_bytes([n[0], n[1], n[2], n[3]])),
++                        None => mem.read(at + off + 8, 4).map(|n| u32::from_le_bytes([n[0], n[1], n[2], n[3]])),
++                    };
++                    found.push(Holder { at: at + off, stage, next });
++                    if found.len() >= HOLDERS_MAX {
++                        break;
++                    }
++                }
++            }
++            at += len;
++        }
++    }
++    found
++}
++
++/// The holders that can be the stage field, and why each other one is not.
++pub(crate) fn pick(all: &[Holder], own_stack: Option<(usize, usize)>) -> (Vec<Holder>, Vec<(Holder, &'static str)>) {
++    let (mut keep, mut drop) = (Vec::new(), Vec::new());
++    for h in all {
++        let why = if own_stack.is_some_and(|(lo, hi)| (lo..hi).contains(&h.at)) {
++            Some("our own stack")
++        } else if all.iter().any(|o| o.at == h.at + STACK_STRIDE || o.at.wrapping_add(STACK_STRIDE) == h.at) {
++            Some("in a run 18h apart (a script stack)")
++        } else if h.next != Some(1) {
++            Some("next word is not 1")
++        } else {
++            None
++        };
++        match why {
++            Some(w) => drop.push((*h, w)),
++            None => keep.push(*h),
++        }
++    }
++    (keep, drop)
++}
++
++/// The holder as it is now, if it still is `{a stage of stages, 1}` with 1 after it.
++pub(crate) fn reread<M: Memory>(mem: &M, at: usize, stages: &[u32]) -> Option<Holder> {
++    let b = mem.read(at, 12)?;
++    let stage = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
++    let one = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
++    let next = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
++    (one == 1 && next == 1 && stages.contains(&stage)).then_some(Holder { at, stage, next: Some(next) })
++}
++
++/// The 8 bytes the jump writes.
++pub(crate) fn field_bytes(stage: u32) -> [u8; 8] {
++    let mut b = [0u8; 8];
++    b[..4].copy_from_slice(&stage.to_le_bytes());
++    b[4..].copy_from_slice(&1u32.to_le_bytes());
++    b
++}
++
++/// A holder list for a reply (at most `max` lines).
++pub(crate) fn holder_lines(keep: &[Holder], drop: &[(Holder, &str)], max: usize) -> String {
++    let mut s = String::new();
++    for h in keep.iter().take(max) {
++        s.push_str(&format!("\n  {:#x} = {} next {}: candidate", h.at, name(h.stage), h.next.map_or("?".into(), |n| format!("{n:#x}"))));
++    }
++    for (h, why) in drop.iter().take(max.saturating_sub(keep.len())) {
++        s.push_str(&format!("\n  {:#x} = {} next {}: not it ({why})", h.at, name(h.stage), h.next.map_or("?".into(), |n| format!("{n:#x}"))));
++    }
++    let shown = keep.len().min(max) + drop.len().min(max.saturating_sub(keep.len()));
++    if keep.len() + drop.len() > shown {
++        s.push_str(&format!("\n  ... {} more", keep.len() + drop.len() - shown));
++    }
++    s
++}
++
++/// Position and clock from the `pos` shorthand's last line (`pos <x> <y> <z> heading <h> time <hh:mm:ss>`).
++pub(crate) fn parse_pos(text: &str) -> Option<([f32; 3], Option<(u32, u32, u32)>)> {
++    let line = text.lines().rev().find(|l| l.starts_with("pos "))?;
++    let w: Vec<&str> = line.split_whitespace().collect();
++    let f = |i: usize| w.get(i)?.parse::<f32>().ok().filter(|v| v.is_finite());
++    let pos = [f(1)?, f(2)?, f(3)?];
++    let clock = w.iter().position(|x| *x == "time").and_then(|i| w.get(i + 1)).and_then(|t| {
++        let mut p = t.split(':').map(|v| v.parse::<u32>().ok());
++        Some((p.next()??, p.next()??, p.next()??))
++    });
++    Some((pos, clock))
++}
++
++/// The options of `checkpoint <stage> [dist=<m>] [wait=<s>] [slot=<addr>]`.
++#[derive(Clone, Debug, PartialEq)]
++pub(crate) struct Ask {
++    pub target: u32,
++    pub dist: f32,
++    pub wait: f32,
++    pub slot: Option<usize>,
++    /// Teleport even though the clock stands still (some stages hold it), but never within
++    /// `FORCE_AFTER_RETRY_S` of a retry.
++    pub force: bool,
++}
++
++/// `force` still waits this long after a retry (a teleport about 40 s after one crashed the title).
++pub(crate) const FORCE_AFTER_RETRY_S: f64 = 120.0;
++
++pub(crate) fn parse_ask(args: &[&str]) -> Result<Ask, String> {
++    let target = parse_stage(args.first().ok_or(USAGE)?)?;
++    let mut ask = Ask { target, dist: 300.0, wait: 120.0, slot: None, force: false };
++    for w in &args[1..] {
++        if *w == "force" {
++            ask.force = true;
++            continue;
++        }
++        let (k, v) = w.split_once('=').ok_or_else(|| format!("{w}: expected dist=<m>, wait=<s> or slot=<addr> ({USAGE})"))?;
++        match k {
++            "dist" => ask.dist = v.parse::<f32>().ok().filter(|d| (50.0..=5000.0).contains(d)).ok_or("dist=<50..5000 m>")?,
++            "wait" => ask.wait = v.parse::<f32>().ok().filter(|d| (10.0..=900.0).contains(d)).ok_or("wait=<10..900 s>")?,
++            "slot" => ask.slot = Some(crate::debugcmd::parse_addr(v, 0).ok_or_else(|| format!("bad address {v}"))?),
++            _ => return Err(format!("unknown option {k} ({USAGE})")),
++        }
++    }
++    Ok(ask)
++}
++
++pub(crate) const USAGE: &str = "checkpoint list | checkpoint <stage: ch1-s1..ch1-s4 or 0x<hash>> [dist=<m>] [wait=<s>] [slot=<addr>] [force]";
++
++/// The text of `checkpoint list`: the known stages, the stages the title announced this session that have no
++/// label, the current stage from the field (if exactly one holder is left), the last announcement.
++pub(crate) fn list_text(seen: &[u32], keep: &[Holder], drop: &[(Holder, &str)], last: Option<(u32, u32, f64)>, hooked: bool) -> String {
++    let mut s = String::from("known stages (build 1.0.2.1, the Chapter 1 opening mission):");
++    for k in &KNOWN {
++        s.push_str(&format!("\n  {} {:#010x}  {}", k.label, k.hash, k.what));
++    }
++    let new: Vec<String> = seen.iter().filter(|h| label(**h).is_none()).map(|h| format!("{h:#010x}")).collect();
++    if !new.is_empty() {
++        s.push_str(&format!("\nalso announced by the title this session (no label yet): {}", new.join(" ")));
++    }
++    match keep {
++        [one] => s.push_str(&format!("\ncurrent stage: {} (field at {:#x})", name(one.stage), one.at)),
++        [] => s.push_str("\ncurrent stage: not found (no mission with a known stage running?)"),
++        _ => s.push_str(&format!("\ncurrent stage: {} candidate fields, not unique:{}", keep.len(), holder_lines(keep, &[], 8))),
++    }
++    if !keep.is_empty() || !drop.is_empty() {
++        s.push_str(&format!("\n({} holders of a known stage, {} left out by the rules)", keep.len() + drop.len(), drop.len()));
++    }
++    match (last, hooked) {
++        (Some((stage, restart, ago)), _) => s.push_str(&format!(
++            "\nlast stage the title announced: {}{} {ago:.0} s ago",
++            name(stage),
++            if restart != 0 { " (a retry)" } else { "" }
++        )),
++        (None, true) => s.push_str("\nthe title has announced no stage yet"),
++        (None, false) => s.push_str("\nstage announcements are not seen: needs VICTORY_NATIVES and MISSION_STAGE_SET in the names file"),
++    }
++    s
++}
++
++#[cfg(windows)]
++pub(crate) use live::{Job, list};
++
++#[cfg(windows)]
++mod live {
++    use super::*;
++    use std::path::{Path, PathBuf};
++    use std::time::{Duration, Instant};
++    use victory_loader::natives;
++
++    /// How long the second look at the candidates waits (a stack slot changes within it, the field does not).
++    const SETTLE: Duration = Duration::from_secs(2);
++    /// A retry this recent: no teleport (a teleport about 40 s after a retry crashed the title once).
++    const AFTER_RETRY: Duration = Duration::from_secs(60);
++    /// How long a queued `pos` / `tp` may take.
++    const CALL_WAIT: Duration = Duration::from_secs(60);
++
++    enum Phase {
++        /// The first `pos` (position and clock) is queued.
++        Pos1 { ids: Vec<u64> },
++        /// Waiting before the second look.
++        Settle { until: Instant },
++        /// The second `pos` is queued (the clock must have moved).
++        Pos2 { ids: Vec<u64> },
++        /// The far teleport is queued.
++        Tp { ids: Vec<u64> },
++        /// Waiting for the title's retry.
++        Retry,
++    }
++
++    /// What one step of a job gives the channel.
++    pub(crate) struct Step {
++        pub lines: Vec<String>,
++        /// The job has ended (the last line says how).
++        pub ended: bool,
++        /// The field, when it was found (the channel then watches it).
++        pub slot: Option<usize>,
++    }
++
++    pub(crate) struct Job {
++        ask: Ask,
++        folder: PathBuf,
++        stages: Vec<u32>,
++        cands: Vec<Holder>,
++        phase: Phase,
++        phase_at: Instant,
++        clock1: Option<(u32, u32, u32)>,
++        pos: [f32; 3],
++        slot: usize,
++        from: u32,
++        /// The stage announcements seen before the teleport.
++        seq0: u64,
++        lines: Vec<String>,
++        results: Vec<String>,
++    }
++
++    /// The last stage announcement: (stage, restart flag, seconds ago).
++    pub(crate) fn last_announced() -> Option<(u32, u32, f64)> {
++        natives::stage_events_after(0).last().map(|e| (e.stage, e.restart, e.at.elapsed().as_secs_f64()))
++    }
++
++    /// The stages to look for: the known ones and every one the title announced this session.
++    pub(crate) fn search_stages() -> Vec<u32> {
++        let mut v: Vec<u32> = KNOWN.iter().map(|s| s.hash).collect();
++        for h in natives::stages_seen() {
++            if !v.contains(&h) {
++                v.push(h);
++            }
++        }
++        v
++    }
++
++    /// Where this thread's stack is (the channel runs on the presenting thread): holders there are our own.
++    pub(crate) fn own_stack() -> Option<(usize, usize)> {
++        let (mut lo, mut hi) = (0usize, 0usize);
++        // SAFETY: two out values.
++        unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi) };
++        (hi > lo).then_some((lo, hi))
++    }
++
++    /// `checkpoint list`; the field too, when exactly one candidate is left.
++    pub(crate) fn list<M: Memory>(mem: &M) -> (String, Option<usize>) {
++        let stages = search_stages();
++        let all = holders(mem, &stages);
++        let (keep, drop) = pick(&all, own_stack());
++        let field = (keep.len() == 1).then(|| keep[0].at);
++        (list_text(&natives::stages_seen(), &keep, &drop, last_announced(), natives::stage_hooked()), field)
++    }
++
++    fn queue(line: &str, folder: &Path) -> Result<Vec<u64>, String> {
++        match natives::command(line, folder) {
++            natives::Reply::Queued(ids, _) => Ok(ids),
++            natives::Reply::Now(Err(e)) => Err(e),
++            natives::Reply::Now(Ok(t)) => Err(format!("`{line}` did not queue: {t}")),
++            natives::Reply::NotOurs => Err("the natives hook is off (VICTORY_NATIVES=1)".into()),
++        }
++    }
++
++    impl Job {
++        /// Starts a jump: checks, finds the candidates, queues the first `pos`. `Err` = refused, nothing done.
++        pub(crate) fn start<M: Memory>(mem: &M, args: &[&str], folder: &Path) -> Result<(Job, String), String> {
++            let ask = parse_ask(args)?;
++            if !natives::stage_hooked() {
++                return Err("needs VICTORY_NATIVES=1 and the name MISSION_STAGE_SET in the names file (the retry is seen through it)".into());
++            }
++            if let Some((stage, 1, ago)) = last_announced().filter(|l| l.2 < AFTER_RETRY.as_secs_f64()) {
++                return Err(format!("the title retried at {} {ago:.0} s ago: no teleport so soon after a retry; try again in a while", name(stage)));
++            }
++            let stages = search_stages();
++            let mut stages_t = stages.clone();
++            if !stages_t.contains(&ask.target) {
++                stages_t.push(ask.target);
++            }
++            let (cands, found) = match ask.slot {
++                Some(at) => match reread(mem, at, &stages) {
++                    Some(h) => (vec![h], format!("field given: {at:#x} = {}", name(h.stage))),
++                    None => return Err(format!("{at:#x} does not hold {{a stage, 1}} followed by 1 (checkpoint list)")),
++                },
++                None => {
++                    let all = holders(mem, &stages);
++                    let (keep, drop) = pick(&all, own_stack());
++                    if keep.is_empty() {
++                        return Err(format!(
++                            "no stage field found ({} holders of a known stage, none fits): is a mission with a known stage running? \
++                             Chapter 1 stages only so far{}",
++                            all.len(),
++                            holder_lines(&keep, &drop, 12)
++                        ));
++                    }
++                    let text = format!("{} candidate field(s) of {} holders; a second look in {} s{}", keep.len(), all.len(), SETTLE.as_secs(), holder_lines(&keep, &drop, 12));
++                    (keep, text)
++                }
++            };
++            let ids = queue("pos", folder)?;
++            let job = Job {
++                ask: ask.clone(),
++                folder: folder.to_path_buf(),
++                stages: stages_t,
++                cands,
++                phase: Phase::Pos1 { ids },
++                phase_at: Instant::now(),
++                clock1: None,
++                pos: [0.0; 3],
++                slot: 0,
++                from: 0,
++                seq0: 0,
++                lines: Vec::new(),
++                results: Vec::new(),
++            };
++            Ok((job, format!("checkpoint -> {}: {found}", name(ask.target))))
++        }
++
++        /// Collects the results of queued calls; `Some(last text)` when all are back.
++        fn collect(&mut self, ids: &[u64]) -> Option<Result<String, String>> {
++            for id in ids {
++                if let Some(t) = natives::result(*id) {
++                    self.results.push(t);
++                }
++            }
++            if self.results.len() >= ids.len() {
++                return Some(Ok(std::mem::take(&mut self.results).pop().unwrap_or_default()));
++            }
++            (self.phase_at.elapsed() > CALL_WAIT).then(|| Err(format!("no result from the title's natives in {} s (no script running?)", CALL_WAIT.as_secs())))
++        }
++
++        fn end(&mut self, text: String, ok: bool) -> Step {
++            self.lines.push(format!("checkpoint {}: {text}", if ok { "done" } else { "STOPPED" }));
++            Step { lines: std::mem::take(&mut self.lines), ended: true, slot: (self.slot != 0).then_some(self.slot) }
++        }
++
++        fn say(&mut self, text: String) {
++            tracing::info!("VICTORY_DEBUG checkpoint: {text}");
++            self.lines.push(text);
++        }
++
++        fn go(&mut self, phase: Phase) {
++            self.phase = phase;
++            self.phase_at = Instant::now();
++        }
++
++        /// One step, on a present.
++        pub(crate) fn step<M: Memory>(&mut self, mem: &M) -> Step {
++            match &self.phase {
++                Phase::Pos1 { ids } => {
++                    let ids = ids.clone();
++                    match self.collect(&ids) {
++                        None => {}
++                        Some(Err(e)) => return self.end(e, false),
++                        Some(Ok(t)) => match parse_pos(&t) {
++                            Some((p, clock)) => {
++                                self.pos = p;
++                                self.clock1 = clock;
++                                self.go(Phase::Settle { until: Instant::now() + SETTLE });
++                            }
++                            None => return self.end(format!("no position came back: {t}"), false),
++                        },
++                    }
++                }
++                Phase::Settle { until } => {
++                    if Instant::now() >= *until {
++                        // The second look: a stack slot has changed by now, the field has not.
++                        let (still, gone): (Vec<Holder>, Vec<Holder>) =
++                            self.cands.iter().copied().partition(|h| reread(mem, h.at, &self.stages).is_some_and(|n| n.stage == h.stage));
++                        if still.len() != 1 {
++                            let mut s = format!("{} field(s) held the stage over {} s, not exactly one: nothing written", still.len(), SETTLE.as_secs());
++                            for h in &still {
++                                s.push_str(&format!("\n  {:#x} = {}: still", h.at, name(h.stage)));
++                            }
++                            for h in &gone {
++                                s.push_str(&format!("\n  {:#x}: changed", h.at));
++                            }
++                            s.push_str("\n(if you know the field, give it: slot=<addr>)");
++                            return self.end(s, false);
++                        }
++                        self.slot = still[0].at;
++                        self.from = still[0].stage;
++                        let text = format!("stage field {:#x} = {} (stable)", self.slot, name(self.from));
++                        self.say(text);
++                        match queue("pos", &self.folder) {
++                            Ok(ids) => self.go(Phase::Pos2 { ids }),
++                            Err(e) => return self.end(e, false),
++                        }
++                    }
++                }
++                Phase::Pos2 { ids } => {
++                    let ids = ids.clone();
++                    match self.collect(&ids) {
++                        None => {}
++                        Some(Err(e)) => return self.end(e, false),
++                        Some(Ok(t)) => {
++                            let Some((p, clock2)) = parse_pos(&t) else { return self.end(format!("no position came back: {t}"), false) };
++                            if clock2.is_none() || clock2 == self.clock1 {
++                                let held = clock2.map_or("?".into(), |(h, m, s)| format!("{h:02}:{m:02}:{s:02}"));
++                                let retry = last_announced().filter(|l| l.1 != 0 && l.2 < FORCE_AFTER_RETRY_S);
++                                if !self.ask.force {
++                                    return self.end(
++                                        format!("the clock stands still ({held}): a cutscene, a retry or a stage loading, or a stage that holds the clock; \
++                                            no teleport now. Try again when `pos` shows the clock moving (or add `force` if this stage holds the clock)"),
++                                        false,
++                                    );
++                                }
++                                if let Some((stage, _, ago)) = retry {
++                                    return self.end(
++                                        format!("the clock stands still ({held}) and the title retried at {} only {ago:.0} s ago: no teleport, even with force \
++                                            (wait {FORCE_AFTER_RETRY_S:.0} s after a retry)", name(stage)),
++                                        false,
++                                    );
++                                }
++                                self.say(format!("the clock stands still ({held}); going on (force)"));
++                            }
++                            if let Some((stage, 1, ago)) = last_announced().filter(|l| l.2 < AFTER_RETRY.as_secs_f64()) {
++                                return self.end(format!("the title retried at {} {ago:.0} s ago: no teleport so soon after a retry", name(stage)), false);
++                            }
++                            self.pos = p;
++                            // The field, read again right before the write.
++                            match reread(mem, self.slot, &self.stages) {
++                                Some(h) => self.from = h.stage,
++                                None => return self.end(format!("the field {:#x} no longer holds a stage: nothing written", self.slot), false),
++                            }
++                            if !mem.write(self.slot, &field_bytes(self.ask.target)) {
++                                return self.end(format!("{:#x} is not writable: nothing written", self.slot), false);
++                            }
++                            let back = mem.read(self.slot, 8).map(|b| u64::from_le_bytes(b[..8].try_into().unwrap_or_default())).unwrap_or(0);
++                            let text = format!("wrote {} into the field {:#x} (was {}; reads back {back:#x})", name(self.ask.target), self.slot, name(self.from));
++                            self.say(text);
++                            self.seq0 = natives::stage_events_after(0).last().map_or(0, |e| e.seq);
++                            let (x, y) = (self.pos[0] - self.ask.dist, self.pos[1]);
++                            let text = format!(
++                                "the mission is made to fail: teleport {:.0} m west, from {:.1} {:.1} {:.1} to {x:.1} {y:.1} 1.0",
++                                self.ask.dist, self.pos[0], self.pos[1], self.pos[2]
++                            );
++                            self.say(text);
++                            match queue(&format!("tp {x:.1} {y:.1} 1.0 90"), &self.folder) {
++                                Ok(ids) => self.go(Phase::Tp { ids }),
++                                Err(e) => {
++                                    // Nothing moved: put the field back.
++                                    mem.write(self.slot, &field_bytes(self.from));
++                                    return self.end(format!("{e} (the field is back at {})", name(self.from)), false);
++                                }
++                            }
++                        }
++                    }
++                }
++                Phase::Tp { ids } => {
++                    let ids = ids.clone();
++                    match self.collect(&ids) {
++                        None => {}
++                        Some(Err(e)) => return self.end(format!("teleport: {e}; the field holds {}", name(self.ask.target)), false),
++                        Some(Ok(t)) => {
++                            let text = format!("after the teleport: {}; waiting up to {:.0} s for the title's retry", t.lines().last().unwrap_or(""), self.ask.wait);
++                            self.say(text);
++                            self.go(Phase::Retry);
++                        }
++                    }
++                }
++                Phase::Retry => {
++                    let events = natives::stage_events_after(self.seq0);
++                    if let Some(e) = events.iter().find(|e| e.restart != 0) {
++                        let field = reread(mem, self.slot, &self.stages).map_or("not a stage now".to_string(), |h| name(h.stage));
++                        let secs = self.phase_at.elapsed().as_secs_f64();
++                        let ok = e.stage == self.ask.target;
++                        let text = format!(
++                            "the title retried the mission {secs:.0} s after the teleport at {} ({}); the field reads {field}. \
++                             The clock stands still until the stage has loaded: no teleport (and no checkpoint) until `pos` shows it moving",
++                            name(e.stage),
++                            if ok { "the stage asked for" } else { "NOT the stage asked for" },
++                        );
++                        return self.end(text, ok);
++                    }
++                    if let Some(e) = events.iter().find(|e| e.restart == 0 && e.stage != self.ask.target) {
++                        let text = format!("note: the title announced {} (no retry) while waiting", name(e.stage));
++                        self.seq0 = e.seq;
++                        self.say(text);
++                    }
++                    if self.phase_at.elapsed().as_secs_f32() > self.ask.wait {
++                        return self.end(
++                            format!(
++                                "no retry within {:.0} s: the mission did not fail at {:.0} m (try a larger dist=), or no mission is running. \
++                                 The field still holds {}: the next retry, whenever it comes, starts there. The player was left where the teleport put them",
++                                self.ask.wait, self.ask.dist, name(self.ask.target)
++                            ),
++                            false,
++                        );
++                    }
++                }
++            }
++            Step { lines: std::mem::take(&mut self.lines), ended: false, slot: (self.slot != 0).then_some(self.slot) }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::debugcmd::Region;
++    use std::cell::RefCell;
++
++    /// Memory: one 4 KB page at 0x10000, read-write.
++    struct Page(RefCell<Vec<u8>>);
++    const AT: usize = 0x10000;
++    impl Memory for Page {
++        fn image_base(&self) -> usize {
++            0
++        }
++        fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
++            let p = self.0.borrow();
++            (addr >= AT && addr + len <= AT + p.len()).then(|| p[addr - AT..addr - AT + len].to_vec())
++        }
++        fn write(&self, addr: usize, bytes: &[u8]) -> bool {
++            let mut p = self.0.borrow_mut();
++            if addr < AT || addr + bytes.len() > AT + p.len() {
++                return false;
++            }
++            p[addr - AT..addr - AT + bytes.len()].copy_from_slice(bytes);
++            true
++        }
++        fn regions(&self) -> Vec<Region> {
++            vec![Region { base: AT, size: 0x1000, image: false }]
++        }
++    }
++
++    fn put(m: &Page, at: usize, stage: u32, next: u32) {
++        assert!(m.write(at, &field_bytes(stage)));
++        assert!(m.write(at + 8, &next.to_le_bytes()));
++    }
++
++    #[test]
++    fn stages_by_label_or_hash() {
++        assert_eq!(parse_stage("ch1-s2"), Ok(0x3382_4f3b));
++        assert_eq!(parse_stage("CH1-S4"), Ok(0x8cf1_71f3));
++        assert_eq!(parse_stage("0x7bf09c68"), Ok(0x7bf0_9c68));
++        assert_eq!(parse_stage("0xdeadbeef"), Ok(0xdead_beef));
++        assert!(parse_stage("ch9").is_err());
++        assert!(parse_stage("0x0").is_err());
++        assert_eq!(name(0x7bf0_9c68), "ch1-s3 (0x7bf09c68)");
++        assert_eq!(name(0x1234), "0x00001234 (no label)");
++        assert_eq!(field_bytes(0x8cf1_71f3), [0xf3, 0x71, 0xf1, 0x8c, 1, 0, 0, 0]);
++        let a = parse_ask(&["ch1-s2", "dist=400", "slot=0x12cf15d68"]).unwrap();
++        assert_eq!(a, Ask { target: 0x3382_4f3b, dist: 400.0, wait: 120.0, slot: Some(0x1_2cf1_5d68), force: false });
++        assert!(parse_ask(&["ch1-s4", "force"]).unwrap().force);
++        assert!(parse_ask(&["ch1-s2", "dist=10"]).is_err());
++        assert!(parse_ask(&["ch1-s2", "speed=1"]).is_err());
++        assert!(parse_ask(&[]).is_err());
++    }
++
++    #[test]
++    fn the_field_and_the_others() {
++        let m = Page(RefCell::new(vec![0u8; 0x1000]));
++        let s3 = 0x7bf0_9c68;
++        // The field: {stage, 1}, then 1.
++        put(&m, AT + 0x568, s3, 1);
++        // A script stack: the same value in slots 18h apart (their next words happen to be 1 too).
++        for k in 0..4 {
++            put(&m, AT + 0x788 + k * STACK_STRIDE, s3, 1);
++        }
++        // A holder whose next word is not 1, and an unknown stage (not looked for).
++        put(&m, AT + 0x900, s3, 0x55);
++        put(&m, AT + 0xa00, 0x1111_2222, 1);
++        // Not aligned to 8: not a holder.
++        put(&m, AT + 0xb04, s3, 1);
++        let stages: Vec<u32> = KNOWN.iter().map(|s| s.hash).collect();
++        let all = holders(&m, &stages);
++        assert_eq!(all.len(), 6, "{all:x?}");
++        let (keep, drop) = pick(&all, None);
++        assert_eq!(keep, vec![Holder { at: AT + 0x568, stage: s3, next: Some(1) }]);
++        assert_eq!(drop.iter().filter(|(_, w)| w.contains("run")).count(), 4);
++        assert_eq!(drop.iter().filter(|(_, w)| w.contains("next")).count(), 1);
++        // On our own stack it is left out too.
++        let (keep, _) = pick(&all, Some((AT + 0x500, AT + 0x600)));
++        assert!(keep.is_empty());
++        // The second look and the write.
++        assert_eq!(reread(&m, AT + 0x568, &stages).map(|h| h.stage), Some(s3));
++        assert!(m.write(AT + 0x568, &field_bytes(0x3382_4f3b)));
++        assert_eq!(reread(&m, AT + 0x568, &stages).map(|h| h.stage), Some(0x3382_4f3b));
++        assert_eq!(reread(&m, AT + 0x900, &stages), None, "next word not 1");
++        let text = list_text(&[0x3382_4f3b, 0x0bad_cafe], &keep, &drop, Some((0x3382_4f3b, 1, 12.0)), true);
++        assert!(text.contains("ch1-s1 0x489b8c77") && text.contains("ch1-s4 0x8cf171f3"), "{text}");
++        assert!(text.contains("no label yet): 0x0badcafe") && !text.contains("yet): 0x33824f3b"), "{text}");
++        assert!(text.contains("current stage: not found"), "{text}");
++        assert!(text.contains("ch1-s2 (0x33824f3b) (a retry) 12 s ago"), "{text}");
++        let (keep, drop) = pick(&all, None);
++        assert!(list_text(&[], &keep, &drop, None, false).contains("current stage: ch1-s3 (0x7bf09c68) (field at 0x10568)"));
++        let lines = holder_lines(&keep, &drop, 3);
++        assert!(lines.contains("0x10568 = ch1-s3 (0x7bf09c68) next 0x1: candidate") && lines.contains("... 3 more"), "{lines}");
++    }
++
++    #[test]
++    fn position_and_clock() {
++        let t = "#5 GET_CLOCK_SECONDS -> ret [0x4]\npos -2068.100 -4375.200 1.500 heading 90.00 time 14:38:04";
++        assert_eq!(parse_pos(t), Some(([-2068.1, -4375.2, 1.5], Some((14, 38, 4)))));
++        assert_eq!(parse_pos("pos 1 2 3 heading ? time ?"), Some(([1.0, 2.0, 3.0], None)));
++        assert_eq!(parse_pos("pos ? (no position came back)"), None);
++    }
++}
+diff --git a/crates/victory-gpu/src/debugcmd.rs b/crates/victory-gpu/src/debugcmd.rs
+index 41b0dcd..f9a48c8 100644
+--- a/crates/victory-gpu/src/debugcmd.rs
++++ b/crates/victory-gpu/src/debugcmd.rs
+@@ -384,6 +384,7 @@ impl<M: Memory> Executor<M> {
+             "help" => Ok("base | peek <addr> <len> | peekf <addr> <n> | poke <addr> <hex> | pokef <addr> <f>... | \
+                 scan [<zmin> <zmax>] | findptr <lo> <hi> | chain <addr> [<off>...] | matrix <off>... | pos | \
+                 tp <x> <y> <z> [<heading>] | time <hh> <mm> | save <name> | goto <name> | marks | settings | \
++                checkpoint list | checkpoint <stage> [dist=<m>] [wait=<s>] [slot=<addr>] [force] (jump to a stage of the running mission) | \
+                 nhelp (script natives: ncall, pos, tp, time, date, tpsave, tpgo, tpmarks, scene, nstat, ntrace, ndump, nlog, nmark, nwatch, nscript, nfind)"
+                 .into()),
+             "base" => {
+@@ -693,6 +694,13 @@ struct Channel {
+     marked: Option<u64>,
+     /// How many of `replies` are in `log.txt` already (each reply is logged once).
+     logged: usize,
++    /// LOCAL (octo, inkVI-dive): the `checkpoint` jump that is running (one at a time).
++    job: Option<crate::checkpoint::Job>,
++    /// The last stage announcement logged (its call number, and (stage, restart flag)).
++    stage_seq: u64,
++    stage_last: Option<(u32, u32)>,
++    /// The stage field once `checkpoint` found it, and its last value: every change is logged.
++    field: Option<(usize, u64)>,
+ }
+ 
+ /// Presents an `ncall` waits for its script-thread result before it is given up (`done` waits for it).
+@@ -716,7 +724,19 @@ fn channel() -> Option<&'static Mutex<Channel>> {
+             let exec = Executor::new(live::Process, &folder);
+             tracing::info!(folder = %folder.display(), base = format_args!("{:#x}", exec.mem.image_base()), ?exec.settings,
+                 "debug command channel on (VICTORY_DEBUG): lines of the file `cmd` run every fourth present; replies in reply.txt");
+-            Some(Mutex::new(Channel { folder, exec, later: Vec::new(), replies: Vec::new(), pending: Vec::new(), marked: None, logged: 0 }))
++            Some(Mutex::new(Channel {
++                folder,
++                exec,
++                later: Vec::new(),
++                replies: Vec::new(),
++                pending: Vec::new(),
++                marked: None,
++                logged: 0,
++                job: None,
++                stage_seq: 0,
++                stage_last: None,
++                field: None,
++            }))
+         })
+         .as_ref()
+ }
+@@ -775,6 +795,56 @@ pub(crate) fn present(frame: u64) {
+         }
+         ch.pending = still;
+     }
++    // LOCAL (octo, inkVI-dive): stage announcements and changes of the stage field go to `log.txt` as they happen
++    // (not into `reply.txt`: they are no answer), so testers can record stages.
++    let ch = &mut *ch;
++    let mut stage_lines = Vec::new();
++    for e in victory_loader::natives::stage_events_after(ch.stage_seq) {
++        ch.stage_seq = e.seq;
++        if ch.stage_last != Some((e.stage, e.restart)) {
++            ch.stage_last = Some((e.stage, e.restart));
++            stage_lines.push(format!("stage {}{} (announced by script {:#x})", crate::checkpoint::name(e.stage), if e.restart != 0 { " RETRY" } else { "" }, e.script));
++        }
++    }
++    if let Some((at, last)) = ch.field.filter(|_| frame.is_multiple_of(4)) {
++        let now = ch.exec.mem.read(at, 8).map(|b| u64::from_le_bytes(b[..8].try_into().unwrap_or_default()));
++        if now != Some(last) {
++            match now.filter(|v| v >> 32 == 1) {
++                Some(v) => {
++                    stage_lines.push(format!("stage field {at:#x}: {} -> {}", crate::checkpoint::name(last as u32), crate::checkpoint::name(v as u32)));
++                    ch.field = Some((at, v));
++                }
++                None => {
++                    stage_lines.push(format!("stage field {at:#x} no longer holds a stage ({}): not watched any more", now.map_or("unreadable".into(), |v| format!("{v:#x}"))));
++                    ch.field = None;
++                }
++            }
++        }
++    }
++    if !stage_lines.is_empty() {
++        let text: String = stage_lines.iter().map(|l| format!("[{stamp}] {l}\n")).collect();
++        for l in &stage_lines {
++            tracing::info!("VICTORY_DEBUG: {l}");
++        }
++        if let Ok(mut log) = std::fs::OpenOptions::new().append(true).create(true).open(ch.folder.join("log.txt")) {
++            use std::io::Write as _;
++            let _ = log.write_all(text.as_bytes());
++        }
++    }
++    if let Some(job) = ch.job.as_mut() {
++        let step = job.step(&ch.exec.mem);
++        if let Some(at) = step.slot.filter(|at| ch.field.is_none_or(|(f, _)| f != *at)) {
++            ch.field = ch.exec.mem.read(at, 8).map(|b| (at, u64::from_le_bytes(b[..8].try_into().unwrap_or_default())));
++        }
++        if !step.lines.is_empty() {
++            ch.replies.push(format!("[{stamp}] {}\n", step.lines.join("\n")));
++            results = true;
++        }
++        if step.ended {
++            ch.job = None;
++            results = true;
++        }
++    }
+     if run_now.is_empty() && !new_cmd && !results {
+         return;
+     }
+@@ -793,6 +863,30 @@ pub(crate) fn present(frame: u64) {
+             ch.replies.push(format!("[{stamp}] > {line}\n{reply}\n"));
+             continue;
+         }
++        // LOCAL (octo, inkVI-dive): `checkpoint list` / `checkpoint <stage> ...` (crate::checkpoint).
++        if words.first() == Some(&"checkpoint") {
++            let reply = match &words[1..] {
++                ["list"] => {
++                    let (text, field) = crate::checkpoint::list(&ch.exec.mem);
++                    if let Some(at) = field.filter(|at| ch.field.is_none_or(|(f, _)| f != *at)) {
++                        ch.field = ch.exec.mem.read(at, 8).map(|b| (at, u64::from_le_bytes(b[..8].try_into().unwrap_or_default())));
++                    }
++                    text
++                }
++                [] => format!("error: {}", crate::checkpoint::USAGE),
++                _ if ch.job.is_some() => "error: a checkpoint jump is running; wait for its last line".to_string(),
++                args => match crate::checkpoint::Job::start(&ch.exec.mem, args, &ch.folder) {
++                    Ok((job, text)) => {
++                        ch.job = Some(job);
++                        text
++                    }
++                    Err(e) => format!("error: {e}"),
++                },
++            };
++            tracing::info!(cmd = %line, ms = began.elapsed().as_millis(), "VICTORY_DEBUG: {}", reply.lines().next().unwrap_or(""));
++            ch.replies.push(format!("[{stamp}] > {line}\n{reply}\n"));
++            continue;
++        }
+         let reply = match victory_loader::natives::command(&line, &ch.folder) {
+             victory_loader::natives::Reply::NotOurs => ch.exec.run(&line),
+             victory_loader::natives::Reply::Now(Ok(text)) => text,
+@@ -815,7 +909,7 @@ pub(crate) fn present(frame: u64) {
+         let _ = log.write_all(new.as_bytes());
+         ch.logged = ch.replies.len();
+     }
+-    if ch.later.is_empty() && ch.pending.is_empty() {
++    if ch.later.is_empty() && ch.pending.is_empty() && ch.job.is_none() {
+         let _ = std::fs::write(ch.folder.join("done"), format!("{stamp}\n"));
+     }
+ }
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index 922f9f7..6766b7a 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -28,6 +28,9 @@ mod shot;
+ // LOCAL (octo, inkVI-dive): `VICTORY_DEBUG` command-file channel (pos/tp/time/peek, bookmarks).
+ #[cfg(feature = "diagnostics")]
+ mod debugcmd;
++// LOCAL (octo, inkVI-dive): `checkpoint` (jump to a stage of the running mission) for the debug channel.
++#[cfg(feature = "diagnostics")]
++mod checkpoint;
+ pub mod console;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod copystat;
+diff --git a/crates/victory-loader/src/natives.rs b/crates/victory-loader/src/natives.rs
+index 4df8a9b..05af2d4 100644
+--- a/crates/victory-loader/src/natives.rs
++++ b/crates/victory-loader/src/natives.rs
+@@ -355,6 +355,9 @@ struct State {
+     /// LOCAL (octo, inkVI-dive): the scene-start method (the name `SCENE_START`), 0 if not named: its calls
+     /// (by a script or by the channel) fill `STARTS`.
+     start_rva: usize,
++    /// LOCAL (octo, inkVI-dive): the native through which the title announces a mission's stage (the name
++    /// `MISSION_STAGE_SET`: (stage hash, restart flag)), 0 if not named: its calls fill `STAGES` (`checkpoint`).
++    stage_rva: usize,
+     scenes: Mutex<Vec<Scene>>,
+     started: Instant,
+     queue: Mutex<Queue>,
+@@ -554,6 +557,7 @@ pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
+     let by_hash: HashMap<u64, usize> = found.iter().map(|&(rva, h)| (h, rva)).collect();
+     let create_rva = names.get("SCENE_CREATE").and_then(|h| by_hash.get(h)).copied().unwrap_or(0);
+     let state_start_rva = methods.get("SCENE_START").copied().unwrap_or(0);
++    let stage_rva = names.get("MISSION_STAGE_SET").and_then(|h| by_hash.get(h)).copied().unwrap_or(0);
+     let state = State {
+         base,
+         size,
+@@ -563,6 +567,7 @@ pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
+         methods,
+         create_rva,
+         start_rva: state_start_rva,
++        stage_rva,
+         scenes: Mutex::new(Vec::new()),
+         started: Instant::now(),
+         queue: Mutex::new(Queue { next_id: 1, ..Queue::default() }),
+@@ -702,6 +707,58 @@ fn note_start(st: &State, obj: u64, script: u32) {
+         ms = st.started.elapsed().as_millis() as u64, "{ENV}: scene started");
+ }
+ 
++/// LOCAL (octo, inkVI-dive): one call of `MISSION_STAGE_SET`: the title announced a mission stage (`restart` 1 =
++/// the retry after a fail restarts the mission at that stage).
++#[derive(Clone, Debug, PartialEq)]
++pub struct StageEvent {
++    /// Counts the calls from 1.
++    pub seq: u64,
++    pub stage: u32,
++    pub restart: u32,
++    pub script: u32,
++    pub at: Instant,
++}
++
++/// The newest stage announcements (`STAGES_MAX`) and every stage hash announced this session.
++static STAGES: Mutex<(Vec<StageEvent>, Vec<u32>, u64)> = Mutex::new((Vec::new(), Vec::new(), 0));
++const STAGES_MAX: usize = 512;
++
++#[cfg(windows)]
++fn note_stage(st: &State, stage: u32, restart: u32, script: u32) {
++    let mut s = lock(&STAGES);
++    s.2 += 1;
++    let seq = s.2;
++    // The title announces each stage twice in a row: only a change is logged.
++    let new = s.0.last().is_none_or(|e| e.stage != stage || e.restart != restart);
++    if s.0.len() >= STAGES_MAX {
++        s.0.remove(0);
++    }
++    s.0.push(StageEvent { seq, stage, restart, script, at: Instant::now() });
++    if !s.1.contains(&stage) && s.1.len() < 4096 {
++        s.1.push(stage);
++    }
++    drop(s);
++    if new {
++        tracing::info!(stage = format_args!("{stage:#010x}"), restart, script = format_args!("{script:#x}"),
++            ms = st.started.elapsed().as_millis() as u64, "{ENV}: mission stage announced");
++    }
++}
++
++/// The stage announcements after call `seq` (0 = all kept), oldest first.
++pub fn stage_events_after(seq: u64) -> Vec<StageEvent> {
++    lock(&STAGES).0.iter().filter(|e| e.seq > seq).cloned().collect()
++}
++
++/// Every stage hash the title announced this session, in order of first announcement.
++pub fn stages_seen() -> Vec<u32> {
++    lock(&STAGES).1.clone()
++}
++
++/// Whether stage announcements are seen (the hook is on and `MISSION_STAGE_SET` is named).
++pub fn stage_hooked() -> bool {
++    STATE.get().is_some_and(|st| st.stage_rva != 0)
++}
++
+ /// Seconds since the scene named `name` was last started, if it was.
+ pub fn since_scene_start(name: u32) -> Option<f64> {
+     lock(&STARTS).iter().find(|(n, _)| *n == name).map(|(_, at)| at.elapsed().as_secs_f64())
+@@ -774,6 +831,15 @@ unsafe extern "win64" fn dispatch(ctx: *mut Ctx, handler: usize, sctx: usize, by
+         // SAFETY: the context the interpreter just built.
+         unsafe { mem_check(st, None, sctx) };
+     }
++    if st.stage_rva != 0 && handler.wrapping_sub(st.base) == st.stage_rva {
++        // SAFETY: the context the interpreter just built: (stage hash, restart flag), read before the call.
++        unsafe {
++            let c = &*ctx;
++            if c.argc >= 2 && !c.args.is_null() {
++                note_stage(st, c.args.read_unaligned() as u32, c.args.add(1).read_unaligned() as u32, script_id(sctx));
++            }
++        }
++    }
+     let mut sampled = None;
+     if TRACING.load(Ordering::Relaxed) {
+         // SAFETY: the context the interpreter just built.

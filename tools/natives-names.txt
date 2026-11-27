@@ -38,3 +38,6 @@ SCENE_ON_EVENT_E m+0x4bfdbb0
 SET_FOCUS_POS 0x15882a4ec477d569
 SET_FOCUS_ENTITY 0x3d5e3d9c92683648
 GET_CAM_COORD 0x13d4be90acad1fda
+# Mission stages (checkpoints): the title announces each stage of the running mission through this native, as
+# (stage hash, restart flag); restart 1 = the retry after a fail restarts the mission at that stage. Needed by `checkpoint`.
+MISSION_STAGE_SET 0x9e1672bf38ba217a

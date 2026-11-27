@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.2 - checkpoints (on inkVI v0.2.1, twelve patches)
+
+- `checkpoint list` and `checkpoint <stage>` (patch 0012): jump to a stage of the running mission by writing the
+  stage into the field the title keeps it in, failing the mission once with a far teleport and letting the title's
+  own retry restart it there. Chapter 1 stages only so far (`ch1-s1` .. `ch1-s4`). docs/checkpoints.md.
+- The channel's `log.txt` gets a line for every stage the title announces (and every change of the stage field once
+  it is known), so new stages can be recorded.
+- Names file: `MISSION_STAGE_SET`, the native the title announces stages with.
+- Capture receipts (`tools/capture-receipt.py`, by TomTomAIbot, PR #1) are part of this version.
+- New: a worked example, [A study on "clown vomit" (user-coined term)](docs/case-study-clown-vomit.md): how to use
+  dive to catch a picture fault that only shows sometimes.
+
+Checked: RESULTS-TBD
+
 ## v0.1 (first version, work in progress) - on inkVI v0.2.1, eleven patches
 
 First packaging of our debug tooling as a kit: the command channel, the natives hook with its commands (pos, tp,

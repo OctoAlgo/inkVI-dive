@@ -1,13 +1,13 @@
 # inkVI-dive
 
-Test tooling for VIctory: teleport, bookmarks, clock, and cutscene replay from a command channel.
+Test tooling for VIctory: teleport, bookmarks, clock, cutscene replay and mission checkpoints from a command channel.
 
 **A testing aid, work in progress.** It is for people who test VIctory builds and want to get the game to a place, a
 time of day or a cutscene without playing there. Tested on Linux under Proton with NVIDIA cards only (RTX 5090,
 RTX 5070 Ti), with the title's Xbox Series X build **1.0.2.1** on the Series X profile. It is not a script hook or a
 mod API: nothing is loaded into the game's scripts, and no command works on another build of the title.
 
-Source only: a pinned [inkVI](https://github.com/OctoAlgo/inkVI) version (v0.2.1), eleven patches on top of it, a build
+Source only: a pinned [inkVI](https://github.com/OctoAlgo/inkVI) version (v0.2.1), twelve patches on top of it, a build
 script, a few small scripts and this README. Every tool is in the **diagnostics build** only and stays off unless its
 switch is set. GPL-3.0, like inkVI and victory-fork.
 
@@ -18,6 +18,7 @@ switch is set. GPL-3.0, like inkVI and victory-fork.
 | 0001 | A command channel: a folder whose file `cmd` the layer reads every fourth frame; the answers go to `reply.txt` and `log.txt`, and `done` appears when everything is back. Raw memory commands (`peek`, `poke`, `base`, ...). | `VICTORY_DEBUG=<folder>` |
 | 0002-0006 | The title's script natives from the channel: the layer hooks the call the title's script interpreter makes for every native, and runs queued calls on a script thread, where the title calls them itself. On top: `pos`, `tp`, `time`, `date`, bookmarks, cutscenes (`scene ...`), any native by name or hash (`ncall`), a trace of what the scripts call. | `VICTORY_NATIVES=1` (`trace`, `log` for the traces) |
 | 0007 | The two hook sites found by byte pattern (each must occur exactly once in the executable's code), not by fixed address. | - |
+| 0012 | `checkpoint`: jump to a stage (checkpoint) of the running mission, and a log line for every stage the title announces. Chapter 1 stages only so far; see [docs/checkpoints.md](docs/checkpoints.md). | `VICTORY_NATIVES=1` |
 | 0008-0011 | Captures for testing pictures: full-size frames, raw rows, a wall-clock window, a window after every start of a chosen cutscene, `cap [<n>]` from the channel, and captures when no swap chain can be made (headless second cards). | `VICTORY_CAPTURE_*` (below) |
 
 `patches/README.md` lists every patch with its files and licence.
@@ -77,6 +78,7 @@ Checked in the game (build 1.0.2.1, Series X profile). The last line of each rep
 | `scene ...` | cutscenes, see below | |
 | `cap [<n>]` | save the next n frames (needs `VICTORY_CAPTURE`) | `cap: presents 1873..1874 are saved` |
 | `ncall <NAME\|0x<hash>\|+0x<rva>\|m+0x<rva>> [ret=<n>] [><var>] [wait=<secs>] [<arg>...]` | any native or script-class method | `#310 SET_CLOCK_TIME ... 9 15 30 -> ret [0x0]` |
+| `checkpoint list` / `checkpoint <stage>` | the known mission stages and the current one / jump to a stage of the running mission (see Checkpoints) | `checkpoint done: the title retried the mission 21 s after the teleport at ch1-s2 (0x33824f3b) ...` |
 | `nstat`, `nfind`, `nscript`, `ntrace`, `nmark`, `nwatch`, `ndump`, `nlog`, `nhelp` | the hook's state, which script runs queued calls, traces | |
 | `peek`, `peekf`, `poke`, `pokef`, `base`, `help` | raw memory (no natives needed) | |
 
@@ -98,6 +100,23 @@ Traces: `VICTORY_NATIVES=trace` counts every native and keeps its first three ca
 `VICTORY_NATIVES_LOG_PER=400` keeps only each native's first 400). `tools/ntrace.py` and `tools/nlogx.py` read them.
 Finding the natives behind something new: run with `log`, do the thing, `nlog`, then
 `nlogx.py natives-log.tsv ms=<from>-<to> max=12` (rare calls in that time window).
+
+## Checkpoints
+
+A test tool for reaching a mission stage quickly: `checkpoint <stage>` writes the stage into the field where the title
+keeps the running mission's current stage, makes the mission fail once with a far teleport, and lets the title's own
+retry restart the mission at that stage, with its own scenes, clock and placement. Backward and forward jumps work in
+the Chapter 1 opening (four known stages, `ch1-s1` .. `ch1-s4`); nothing else is shown yet.
+
+    DWAIT=300 tools/dcmd.sh <channel> "checkpoint list"
+    DWAIT=300 tools/dcmd.sh <channel> "checkpoint ch1-s2"
+
+Limits, up front: Chapter 1 stages only; a mission must be running (one that fails by distance); the jump fails the
+mission on purpose; passing a mission, free roam and later chapters are not shown; a forward jump skips whatever the
+skipped stages would have set, so never keep playing on that save; the field's address differs by build (it is found
+fresh every time, and the command refuses if it does not find exactly one); copies of saves only. Every stage the
+title announces is written to the channel's `log.txt`, so new stages can be recorded. Details, options and how it
+works: [docs/checkpoints.md](docs/checkpoints.md).
 
 ## Cutscenes
 
@@ -147,6 +166,11 @@ the files from that run. Independently rendered frames can differ.
 Cutscenes keep to the wall clock, not to frames: at a low frame rate a short shot is only a few frames, wherever the
 capture starts. Without a swap chain (a second card on a virtual X server: "surface is not supported for
 presentation") wanted frames are still read back and saved.
+
+## Worked example: catching a fault that only shows sometimes
+
+[A study on "clown vomit" (user-coined term)](docs/case-study-clown-vomit.md): how to use dive to catch a picture fault
+that only shows sometimes (captures pinned to a cutscene's clock, one change per run, a control run).
 
 ## Worked example: the iguana shot, played twice
 
@@ -212,7 +236,9 @@ them: a `tp` streams the area in and holds the player until the ground is there.
   jump: in the Chapter 1 opening (boat stage) steps of 25, 50, 100 and 200 m west of the dock held, and at 300 m the
   mission restarted within 10 s (the player put back, the clock frozen). A `tp` shortly after such a restart crashed
   the game inside the title's own teleport: wait until the mission runs again (`pos` shows the clock moving). Far
-  teleports outside missions are untested (we have no free-roam save yet).
+  teleports outside missions are untested (we have no free-roam save yet). `checkpoint` keeps to this: it refuses
+  while the clock stands still and for 60 s after a retry, and never teleports after the retry it caused.
+- **Checkpoints:** Chapter 1 stages only, and the jump fails the mission on purpose (docs/checkpoints.md).
 - **One crash cause to avoid:** never call `SCENE_ON_EVENT` (`m+0x4bfdb10` / `m+0x4bfdbb0`) by hand. Its second
   argument is a script function; anything else is called as one when the event fires and the game faults.
 - `ncall` with a wrong argument count or a made-up pointer can crash the game, and `m+0x<rva>` with a wrong address
@@ -227,8 +253,8 @@ them: a `tp` streams the area in and holds the player until the ground is there.
 
 After that: a basic UI for the commands, an in-game menu or overlay, so the commands need no terminal.
 
-Looking into, not promised: the title's own camera and player handlers for replayed cutscenes, weather, and mission
-checkpoints.
+Looking into, not promised: the title's own camera and player handlers for replayed cutscenes, weather, and checkpoint
+stages of more missions.
 
 ## Credits
 
@@ -236,15 +262,19 @@ checkpoints.
   the base, through inkVI.
 - The name hash (Jenkins one-at-a-time over lower-cased text) and the naming style of the script natives are community
   knowledge; every hash, address and behaviour here was read from our own copy of the title and checked in the game.
+- Checkpoints (the study and the `checkpoint` command): octo / inkVI.
+- Capture receipts (`tools/capture-receipt.py`): TomTomAIbot.
 
 ## What this kit ships, and what it does not
 
-Ships: eleven patches (all our own, GPL-3.0), a build script, `tools/` (`dcmd.sh`, the trace readers `ntrace.py` and
-`nlogx.py`, `natives-names.txt`, `bookmarks.example.txt`), this README, a changelog and the licence.
+Ships: twelve patches (all our own, GPL-3.0), a build script, `tools/` (`dcmd.sh`, the trace readers `ntrace.py` and
+`nlogx.py`, `capture-receipt.py` and its test, `natives-names.txt`, `bookmarks.example.txt`), this README, `docs/`, a
+changelog and the licence.
 Does not ship: any binary, the title or any of its files, inkVI's or victory-fork's code (fetched at pinned commits by
-`build.sh`), saves, traces, logs, frames, screenshots or other game images, and no strings or tables extracted from the
-title. Of the title it contains only facts needed to find and call things: the two byte patterns above, the build's
-hash prefix, native hashes and method addresses in the names file, and a few addresses in comments and examples.
+`build.sh`), saves, traces, logs, frames, screenshots or other game images (one exception: the cropped two-frame comparison
+of a shirt collar in `docs/images/`, for the case study), and no strings or tables extracted from the title. Of the title it contains only facts needed to find and call things: the two byte patterns above, the build's
+hash prefix, native hashes and method addresses in the names file, four Chapter 1 stage hashes, and a few addresses in
+comments and examples.
 
 ## Licence
 

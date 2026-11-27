@@ -208,10 +208,13 @@ them: a `tp` streams the area in and holds the player until the ground is there.
 
 ## Next
 
-- A basic UI for the commands: an in-game menu or overlay, so the commands need no terminal.
+- Shareable test cases: a save point, a spot, a time and the frames to compare.
+- A one-key snapshot in a running session (screenshot plus position, camera, clock, settings and the log's tail, to
+  reproduce an issue).
 
-Looking into, not promised: a one-key snapshot (screenshot plus position, camera, clock, settings and the log's tail,
-to reproduce an issue), the title's own camera and player handlers for replayed cutscenes, weather, and mission
+After that: a basic UI for the commands, an in-game menu or overlay, so the commands need no terminal.
+
+Looking into, not promised: the title's own camera and player handlers for replayed cutscenes, weather, and mission
 checkpoints.
 
 ## Credits

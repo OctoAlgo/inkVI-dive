@@ -1,0 +1,89 @@
+From 35c8f46e8af7d44a9ea31cb296de0d85739e30cf Mon Sep 17 00:00:00 2001
+From: Octo <180629317+OctoAlgo@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 04:47:02 +0100
+Subject: [PATCH 09/11] VICTORY_CAPTURE_SECS=<a>-<b> (every frame in a
+ wall-time window after world frame 0), VICTORY_CAPTURE_RAW=1
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Kit-Source: own (inkVI-dive, captures)
+Kit-Licence: GPL-3.0
+---
+ crates/victory-gpu/src/capture.rs | 51 ++++++++++++++++++++++++++++++-
+ 1 file changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/crates/victory-gpu/src/capture.rs b/crates/victory-gpu/src/capture.rs
+index df85f3ecc..da63efd74 100644
+--- a/crates/victory-gpu/src/capture.rs
++++ b/crates/victory-gpu/src/capture.rs
+@@ -160,6 +160,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+         && drawn.saturating_sub(before) >= 500
+         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
+     {
++        let _ = WORLD_AT.set(std::time::Instant::now());
+         tracing::info!(frame, "the first frame of 500 draws or more: frames {} and {} are captured", frame + 2, frame + 6);
+         #[cfg(feature = "diagnostics")]
+         if let Some(folder) = folder() {
+@@ -180,7 +181,42 @@ pub(crate) fn wanted(n: u64) -> bool {
+     // run, so single frames cannot be compared between runs).
+     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
+-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
++    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || in_secs(n))
++}
++
++/// LOCAL (octo, inkVI-dive): when world frame 0 was presented (`VICTORY_CAPTURE_WORLD`).
++static WORLD_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++
++/// LOCAL (octo, inkVI-dive): `VICTORY_CAPTURE_SECS=<a>-<b>` (with
++/// `VICTORY_CAPTURE_WORLD`): every frame presented between `a` and `b`
++/// seconds of wall time after world frame 0 is saved (the title's
++/// cutscenes keep to the clock, not to frames). Decided once per frame, so
++/// the read-back path and the save agree.
++fn in_secs(n: u64) -> bool {
++    use std::sync::atomic::Ordering::Relaxed;
++    static WINDOW: std::sync::OnceLock<Option<(f64, f64)>> = std::sync::OnceLock::new();
++    let Some((a, b)) = *WINDOW.get_or_init(|| {
++        let v = std::env::var("VICTORY_CAPTURE_SECS").ok()?;
++        let (a, b) = v.split_once('-')?;
++        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
++    }) else {
++        return false;
++    };
++    // (frame << 1) | decision of the last frame asked about.
++    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
++    let last = LAST.load(Relaxed);
++    if last != u64::MAX && last >> 1 == n {
++        return last & 1 == 1;
++    }
++    let yes = WORLD_AT.get().is_some_and(|at| {
++        let t = at.elapsed().as_secs_f64();
++        t >= a && t <= b
++    });
++    LAST.store((n << 1) | u64::from(yes), Relaxed);
++    if yes {
++        tracing::info!(frame = n, secs = WORLD_AT.get().map(|at| at.elapsed().as_secs_f64()), "VICTORY_CAPTURE_SECS: frame in the window");
++    }
++    yes
+ }
+ 
+ /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
+@@ -192,6 +228,19 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
+ /// with `VICTORY_CAPTURE_FULL=1`).
+ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
+     let Some(folder) = folder() else { return };
++    // LOCAL (octo, inkVI-dive): `VICTORY_CAPTURE_RAW=1` writes the rows as they
++    // are (no PNG, much faster): `<name>-<w>x<h>-<rgba|bgra>-p<pitch>.raw`.
++    static RAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if *RAW.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_RAW").is_some_and(|v| v == "1")) {
++        let kind = if bgra { "bgra" } else { "rgba" };
++        let path = folder.join(format!("{name}-{width}x{height}-{kind}-p{pitch}.raw"));
++        let len = (pitch * height as usize).min(rows.len());
++        match std::fs::write(&path, &rows[..len]) {
++            Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
++            Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
++        }
++        return;
++    }
+     // LOCAL (octo, inkVI-dive): `VICTORY_CAPTURE_FULL=1` saves every pixel
+     // (full size) instead of every other pixel of every other row.
+     static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

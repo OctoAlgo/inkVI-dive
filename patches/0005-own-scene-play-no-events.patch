@@ -1,0 +1,57 @@
+From 656feea63131d24df4aa7b421cb7a5e270e2b66d Mon Sep 17 00:00:00 2001
+From: Octo <180629317+OctoAlgo@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:05:06 +0100
+Subject: [PATCH 05/11] scene play without event subscriptions
+
+The method the title's scripts call after a scene create with 3, 4, 8, 16h is not a flag setter:
+it subscribes a script function to a scene event. Zeroed buffers given in its place were called
+as null script functions when the first event fired (run nat5: fault in the VM's function entry,
+3 s after the load). scene play now only creates, sets the player's role if asked (as=<role>),
+loads, waits until ready and starts. The id takeover of a channel-made scene worked in that run.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Kit-Source: own (inkVI-dive)
+Kit-Licence: GPL-3.0
+---
+ crates/victory-loader/src/natives.rs | 17 ++++++++---------
+ 1 file changed, 8 insertions(+), 9 deletions(-)
+
+diff --git a/crates/victory-loader/src/natives.rs b/crates/victory-loader/src/natives.rs
+index 526aa5230..f25e0f16f 100644
+--- a/crates/victory-loader/src/natives.rs
++++ b/crates/victory-loader/src/natives.rs
+@@ -1375,11 +1375,11 @@ pub fn scene_lines(args: &[&str]) -> Result<(Vec<String>, After), String> {
+         ["start"] => vec!["SCENE_START $_scene".to_string()],
+         ["stop"] => vec!["SCENE_STOP $_scene 1 1 1".to_string()],
+         ["state"] => Vec::new(),
+-        // As the title's scripts do it for a cutscene: create, clear the flags 3, 4, 8 and 16h, the player as
+-        // the role named by `as=<role>` if given, load, wait until ready, start.
++        // As the title's scripts do it for a cutscene, without their event handlers (those are script
++        // functions: a null one crashes the game when its event fires): create, the player as the
++        // role named by `as=<role>` if given, load, wait until ready, start.
+         ["play", name, rest @ ..] => {
+             let mut v = vec![new(name, rest.iter().find(|w| !w.starts_with("as=")))?];
+-            v.extend([3, 4, 8, 0x16].map(|n| format!("SCENE_SET_FLAG $_scene buf:8 {n} 0 0")));
+             if let Some(role) = rest.iter().find_map(|w| w.strip_prefix("as=")) {
+                 v.push("PLAYER_PED_ID ret=2 >_ped".to_string());
+                 v.push(format!("SCENE_SET_ENTITY $_scene {:#x} $_ped 0", scene_name(role)?));
+@@ -1558,14 +1558,13 @@ mod tests {
+         assert_eq!(scene_name("adder"), Ok(0xb779_a091));
+         let (calls, after) = scene_lines(&["play", "0xf2d9d324"]).unwrap();
+         assert_eq!(calls[0], "SCENE_CREATE >_scene 0xf2d9d324 0x220 0 0 1");
+-        assert_eq!(calls[1], "SCENE_SET_FLAG $_scene buf:8 3 0 0");
+-        assert_eq!(calls[4], "SCENE_SET_FLAG $_scene buf:8 22 0 0");
+-        assert_eq!(calls[5], "SCENE_LOAD $_scene");
+-        assert_eq!(calls[6], "SCENE_IS_READY >_sy $_scene 0 wait=120");
+-        assert_eq!(calls[7], "SCENE_START $_scene");
++        assert_eq!(calls[1], "SCENE_LOAD $_scene");
++        assert_eq!(calls[2], "SCENE_IS_READY >_sy $_scene 0 wait=120");
++        assert_eq!(calls[3], "SCENE_START $_scene");
+         let (calls, _) = scene_lines(&["play", "0xf2d9d324", "0x0", "as=lucia"]).unwrap();
+         assert_eq!(calls[0], "SCENE_CREATE >_scene 0xf2d9d324 0x0 0 0 1");
+-        assert_eq!(calls[6], "SCENE_SET_ENTITY $_scene 0x2fe5af54 $_ped 0");
++        assert_eq!(calls[2], "SCENE_SET_ENTITY $_scene 0x2fe5af54 $_ped 0");
++        assert_eq!(calls[3], "SCENE_LOAD $_scene");
+         assert_eq!(calls.last().unwrap(), "SCENE_HAS_ENDED >_se $_scene 0");
+         assert_eq!(after, After::Scene);
+         assert_eq!(scene_lines(&["new", "adder", "0x0"]).unwrap().0[0], "SCENE_CREATE >_scene 0xb779a091 0x0 0 0 1");

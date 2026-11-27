@@ -1,0 +1,1240 @@
+From 0c1312f7d6fb78f24da264d7fb656f332fccb464 Mon Sep 17 00:00:00 2001
+From: Octo <180629317+OctoAlgo@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:56:50 +0100
+Subject: [PATCH 02/11] VICTORY_NATIVES: call the title's script natives from
+ the debug channel
+
+GTA VI 1.0.2.1 has no natives table: each of the 6820 handlers holds its own 64-bit hash
+(`cmp dword [rcx+10h], 0` ... `movabs r, hash ; mov [args], r`), and scripts call them by code
+offset from the interpreter's NATIVE opcode (+0x3de7411). VICTORY_NATIVES=1|trace|log (diagnostics
+build, title executable of that build only):
+ * finds the handlers by that shape through the image's function table (6820 expected);
+ * replaces the opcode's `lea rcx, [rsp+0A8h] ; vzeroupper ; call r15` at +0x3de7503 (14 bytes,
+   checked, logged) with a call to a stub near the image that hands context, handler and script
+   context to natives::dispatch, which runs the queued calls and then the script's own native: a
+   queued call runs on a script thread inside a script's update;
+ * trace: per native the call count and the first three calls' arguments and results, marks every
+   25 world frames, per-script and per-thread counts; log: every call; nwatchmem: which native
+   changes a range of the image's data.
+Debug channel: ncall <NAME|0xhash|+0xrva> [ret=<n>] [><var>] <args> (ints, floats, s:TEXT, h:TEXT,
+v:x,y,z, $var, buf:<n>), npos, ntp, ntime, nstat, ntrace, ndump, nlog, nmark, nwatch, nwatchmem,
+nscript, nfind; `done` waits for the results. Names: VICTORY_NATIVES_NAMES (NAME 0x<hash> lines).
+The channel's img+ addresses now work (the loader tells it where the title is mapped).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Kit-Source: own (inkVI-dive)
+Kit-Licence: GPL-3.0
+---
+ Cargo.lock                           |    1 +
+ crates/victory-gpu/Cargo.toml        |    4 +-
+ crates/victory-gpu/src/debugcmd.rs   |   58 +-
+ crates/victory-loader/src/hooks.rs   |    2 +-
+ crates/victory-loader/src/lib.rs     |    3 +
+ crates/victory-loader/src/natives.rs | 1010 ++++++++++++++++++++++++++
+ crates/victory-loader/src/windows.rs |    6 +
+ 7 files changed, 1075 insertions(+), 9 deletions(-)
+ create mode 100644 crates/victory-loader/src/natives.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 29bab8c72..10a4eb0fd 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -678,6 +678,7 @@ dependencies = [
+  "tempfile",
+  "tracing",
+  "victory-formats",
++ "victory-loader",
+  "victory-pipeline",
+  "victory-shader",
+  "windows",
+diff --git a/crates/victory-gpu/Cargo.toml b/crates/victory-gpu/Cargo.toml
+index b6e37f5f2..a44d3ea13 100644
+--- a/crates/victory-gpu/Cargo.toml
++++ b/crates/victory-gpu/Cargo.toml
+@@ -15,13 +15,15 @@ anyhow.workspace = true
+ victory-formats.workspace = true
+ victory-pipeline.workspace = true
+ victory-shader.workspace = true
++# LOCAL (octo, inkVI-dive): the debug channel's `ncall` family lives in the loader (diagnostics only).
++victory-loader = { workspace = true, optional = true }
+ 
+ [dev-dependencies]
+ tempfile.workspace = true
+ 
+ [features]
+ # Debugging switches (frame capture, the host debug layer, per-draw data).
+-diagnostics = []
++diagnostics = ["dep:victory-loader", "victory-loader/diagnostics"]
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/victory-gpu/src/debugcmd.rs b/crates/victory-gpu/src/debugcmd.rs
+index 7b62a0ca0..d33479525 100644
+--- a/crates/victory-gpu/src/debugcmd.rs
++++ b/crates/victory-gpu/src/debugcmd.rs
+@@ -383,7 +383,8 @@ impl<M: Memory> Executor<M> {
+         match cmd {
+             "help" => Ok("base | peek <addr> <len> | peekf <addr> <n> | poke <addr> <hex> | pokef <addr> <f>... | \
+                 scan [<zmin> <zmax>] | findptr <lo> <hi> | chain <addr> [<off>...] | matrix <off>... | pos | \
+-                tp <x> <y> <z> [<heading>] | time <hh> <mm> | save <name> | goto <name> | marks | settings"
++                tp <x> <y> <z> [<heading>] | time <hh> <mm> | save <name> | goto <name> | marks | settings | \
++                nhelp (script natives: ncall, nstat, ntrace, ndump, nmark, nwatch, nscript, nfind)"
+                 .into()),
+             "base" => {
+                 let b = self.mem.image_base();
+@@ -630,7 +631,11 @@ mod live {
+                 let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+                 // SAFETY: a NUL-terminated name; the handle is only read as a number.
+                 let h = unsafe { GetModuleHandleW(wide.as_ptr()) };
+-                let base = h as usize;
++                let mut base = h as usize;
++                if base == 0 {
++                    // LOCAL (octo, inkVI-dive): the loader maps the title under another file name; it knows the base.
++                    base = victory_loader::natives::title_base();
++                }
+                 if base == 0 {
+                     tracing::warn!(name, "VICTORY_DEBUG: the title's module was not found; `img+` addresses are unavailable");
+                 }
+@@ -681,8 +686,16 @@ struct Channel {
+     later: Vec<(u64, String)>,
+     /// Lines run for the current `cmd` so far (for `done`).
+     replies: Vec<String>,
++    /// LOCAL (octo, inkVI-dive): queued native calls (`ncall`) whose result is not back yet: (id, presents waited).
++    pending: Vec<(u64, u32)>,
++    /// The last world frame the natives trace was marked with.
++    marked: Option<u64>,
+ }
+ 
++/// Presents an `ncall` waits for its script-thread result before it is given up (`done` waits for it).
++#[cfg(windows)]
++const NCALL_WAIT_PRESENTS: u32 = 1800;
++
+ #[cfg(windows)]
+ fn channel() -> Option<&'static Mutex<Channel>> {
+     static CHANNEL: OnceLock<Option<Mutex<Channel>>> = OnceLock::new();
+@@ -700,7 +713,7 @@ fn channel() -> Option<&'static Mutex<Channel>> {
+             let exec = Executor::new(live::Process, &folder);
+             tracing::info!(folder = %folder.display(), base = format_args!("{:#x}", exec.mem.image_base()), ?exec.settings,
+                 "debug command channel on (VICTORY_DEBUG): lines of the file `cmd` run every fourth present; replies in reply.txt");
+-            Some(Mutex::new(Channel { folder, exec, later: Vec::new(), replies: Vec::new() }))
++            Some(Mutex::new(Channel { folder, exec, later: Vec::new(), replies: Vec::new(), pending: Vec::new(), marked: None }))
+         })
+         .as_ref()
+ }
+@@ -734,13 +747,44 @@ pub(crate) fn present(frame: u64) {
+             }
+         }
+     }
+-    if run_now.is_empty() && !new_cmd {
+-        return;
++    // LOCAL (octo, inkVI-dive): the natives trace gets a mark every 25 world frames, and the results of queued
++    // native calls (run on a script thread) are collected here.
++    if let Some(w) = world.filter(|w| w % 25 == 0 && ch.marked != Some(*w)) {
++        ch.marked = Some(w);
++        victory_loader::natives::mark(&format!("world {w} present {frame}"));
+     }
+     let stamp = format!("present {frame} world {}", world.map_or("-".to_string(), |w| w.to_string()));
++    let mut results = false;
++    if !ch.pending.is_empty() {
++        let mut still = Vec::new();
++        for (id, waited) in std::mem::take(&mut ch.pending) {
++            if let Some(text) = victory_loader::natives::result(id) {
++                tracing::info!("VICTORY_DEBUG: {text}");
++                ch.replies.push(format!("[{stamp}] {text}\n"));
++                results = true;
++            } else if waited >= NCALL_WAIT_PRESENTS {
++                ch.replies.push(format!("[{stamp}] #{id}: no result after {waited} presents (no script called a native; still queued)\n"));
++                results = true;
++            } else {
++                still.push((id, waited + 1));
++            }
++        }
++        ch.pending = still;
++    }
++    if run_now.is_empty() && !new_cmd && !results {
++        return;
++    }
+     for line in run_now {
+         let began = std::time::Instant::now();
+-        let reply = ch.exec.run(&line);
++        let reply = match victory_loader::natives::command(&line, &ch.folder) {
++            victory_loader::natives::Reply::NotOurs => ch.exec.run(&line),
++            victory_loader::natives::Reply::Now(Ok(text)) => text,
++            victory_loader::natives::Reply::Now(Err(e)) => format!("error: {e}"),
++            victory_loader::natives::Reply::Queued(ids, text) => {
++                ch.pending.extend(ids.into_iter().map(|id| (id, 0)));
++                text
++            }
++        };
+         let ms = began.elapsed().as_millis();
+         tracing::info!(cmd = %line, ms, "VICTORY_DEBUG: {}", reply.lines().next().unwrap_or(""));
+         ch.replies.push(format!("[{stamp}] > {line}\n{reply}\n"));
+@@ -751,7 +795,7 @@ pub(crate) fn present(frame: u64) {
+         use std::io::Write as _;
+         let _ = log.write_all(text.as_bytes());
+     }
+-    if ch.later.is_empty() {
++    if ch.later.is_empty() && ch.pending.is_empty() {
+         let _ = std::fs::write(ch.folder.join("done"), format!("{stamp}\n"));
+     }
+ }
+diff --git a/crates/victory-loader/src/hooks.rs b/crates/victory-loader/src/hooks.rs
+index b6e117fdc..be0f4f520 100644
+--- a/crates/victory-loader/src/hooks.rs
++++ b/crates/victory-loader/src/hooks.rs
+@@ -85,7 +85,7 @@ unsafe fn apply(base: usize, p: &Patch) -> bool {
+ ///
+ /// # Safety
+ /// `at..at + new.len()` is mapped image memory that no thread is executing.
+-unsafe fn write(at: *mut u8, new: &[u8]) -> bool {
++pub(crate) unsafe fn write(at: *mut u8, new: &[u8]) -> bool {
+     let mut old = 0;
+     // SAFETY: changing the protection of those bytes only, restored below.
+     if unsafe { VirtualProtect(at as _, new.len(), PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+diff --git a/crates/victory-loader/src/lib.rs b/crates/victory-loader/src/lib.rs
+index 300aa136c..1040f3cf4 100644
+--- a/crates/victory-loader/src/lib.rs
++++ b/crates/victory-loader/src/lib.rs
+@@ -27,6 +27,9 @@ mod crash;
+ // LOCAL (octo): the testers build's `VICTORY_NO_WATCHDOG` hook (upstream PR #454).
+ #[cfg(windows)]
+ mod hooks;
++// LOCAL (octo, inkVI-dive): the title's script natives for the debug channel (`VICTORY_NATIVES`).
++#[cfg(all(windows, feature = "diagnostics"))]
++pub mod natives;
+ pub mod prepare;
+ pub mod resolve;
+ #[cfg(all(windows, feature = "diagnostics"))]
+diff --git a/crates/victory-loader/src/natives.rs b/crates/victory-loader/src/natives.rs
+new file mode 100644
+index 000000000..58107bfb9
+--- /dev/null
++++ b/crates/victory-loader/src/natives.rs
+@@ -0,0 +1,1010 @@
++//! LOCAL (octo, inkVI-dive): the title's script natives, for
++//! the diagnostics build's debug channel.
++//!
++//! GTA VI 1.0.2.1 (how it was found: the inkVI-dive README):
++//!  * a script native is a function `handler(ctx)` with
++//!    `ctx = { args: *mut u64, ret: *mut u64, argc: u32, retc: u32 }`; every
++//!    handler starts with `cmp dword [rcx+10h], 0` and holds its own 64-bit
++//!    hash (`movabs r, hash ; mov [args], r` on the `argc < 0` path). There
++//!    is no table in the image: [`scan`] finds the 6820 handlers by that
++//!    shape through the image's function table;
++//!  * the script interpreter (+0x3de2550) calls a native in its NATIVE
++//!    opcode: `lea rcx, [rsp+0A8h] ; vzeroupper ; call r15` at +0x3de7503.
++//!
++//! `VICTORY_NATIVES=1` replaces those 14 bytes (checked) with a call to a
++//! small stub of ours, which hands the context, the handler and the running
++//! script's context to [`dispatch`]. `dispatch` first runs the calls the
++//! debug channel queued (`ncall`), so they happen on a script thread inside
++//! a script's update, exactly where the title calls natives itself, then
++//! the native the script asked for. `VICTORY_NATIVES=trace` also records,
++//! per native, how often it is called and its first calls' arguments.
++
++use std::collections::{HashMap, VecDeque};
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
++use std::sync::{Mutex, MutexGuard, OnceLock};
++use std::time::Instant;
++
++/// Environment variable: `1` = hook + call queue, `trace` = also the trace.
++pub const ENV: &str = "VICTORY_NATIVES";
++/// Optional file of names: lines `NAME 0x<hash>` (`#` comments).
++pub const NAMES_ENV: &str = "VICTORY_NATIVES_NAMES";
++/// Optional memory watch from the start: `+0x<rva>:<len>[,...]` (see `nwatchmem`).
++pub const WATCHMEM_ENV: &str = "VICTORY_NATIVES_WATCHMEM";
++
++/// First 16 hex digits of the BLAKE3 of the Series X 1.0.2.1 executable.
++const BUILD_1_0_2_1: &str = "b99f876b74d4a77f";
++/// The NATIVE opcode's call: `lea rcx, [rsp+0A8h] ; vzeroupper ; call r15`.
++const SITE: usize = 0x3de_7503;
++const SITE_BYTES: [u8; 14] = [0x48, 0x8d, 0x8c, 0x24, 0xa8, 0, 0, 0, 0xc5, 0xf8, 0x77, 0x41, 0xff, 0xd7];
++/// How many handlers this build has (a different count is only warned about).
++const HANDLERS_1_0_2_1: usize = 6820;
++/// Samples (first calls with their arguments) kept per native.
++const SAMPLES: usize = 3;
++/// Calls of a watched native that are kept.
++const WATCH_MAX: usize = 400;
++
++/// The title's native call context.
++#[repr(C)]
++pub struct Ctx {
++    args: *mut u64,
++    ret: *mut u64,
++    argc: u32,
++    retc: u32,
++}
++
++/// One argument of a queued call.
++#[derive(Clone, Debug, PartialEq)]
++pub enum Arg {
++    Val(u64),
++    /// The slots a previous call stored under a name (`$name`), or one of them (`$name.1`).
++    Var(String, Option<usize>),
++}
++
++struct Call {
++    id: u64,
++    rva: usize,
++    args: Vec<Arg>,
++    nret: usize,
++    store: Option<String>,
++    text: String,
++}
++
++#[derive(Clone, Default)]
++struct Sample {
++    seq: u64,
++    ms: u64,
++    script: u32,
++    args: Vec<u64>,
++    strs: Vec<(usize, String)>,
++    ret: Vec<u64>,
++}
++
++#[derive(Default)]
++struct Stat {
++    count: u64,
++    argc: u32,
++    retc: u32,
++    first_seq: u64,
++    samples: Vec<Sample>,
++}
++
++#[derive(Default)]
++struct Trace {
++    stats: HashMap<usize, Stat>,
++    scripts: HashMap<u32, u64>,
++    marks: Vec<(u64, String)>,
++    watch: Vec<usize>,
++    watched: Vec<(usize, Sample)>,
++    /// Native calls per thread id.
++    threads: HashMap<u32, u64>,
++    /// Watched memory (`nwatchmem`): address, the bytes last seen.
++    mem: Vec<(usize, Vec<u8>)>,
++    mem_events: Vec<String>,
++    /// Events noted per first changed offset (a counter that changes every frame is noted only a few times).
++    mem_seen: HashMap<usize, u32>,
++    /// Every call (`VICTORY_NATIVES=log`): call number, rva, script, argc, the first four args, the first return slot.
++    log: Vec<(u64, u32, u32, u32, [u64; 4], u64)>,
++}
++
++#[derive(Default)]
++struct Queue {
++    calls: VecDeque<Call>,
++    done: HashMap<u64, String>,
++    vars: HashMap<String, Vec<u64>>,
++    /// Only this script (program id) runs queued calls; 0 = any.
++    only_script: u32,
++    next_id: u64,
++}
++
++struct State {
++    base: usize,
++    size: usize,
++    by_hash: HashMap<u64, usize>,
++    by_rva: HashMap<usize, u64>,
++    names: HashMap<String, u64>,
++    started: Instant,
++    queue: Mutex<Queue>,
++    trace: Mutex<Trace>,
++}
++
++static STATE: OnceLock<State> = OnceLock::new();
++/// The mapped title executable's base (for the debug channel's `img+` addresses), whether or not the hook is on.
++static TITLE_BASE: AtomicUsize = AtomicUsize::new(0);
++
++/// Where the title's executable is mapped (0 before that).
++pub fn title_base() -> usize {
++    TITLE_BASE.load(Ordering::Relaxed)
++}
++static QUEUED: AtomicUsize = AtomicUsize::new(0);
++static TRACING: AtomicBool = AtomicBool::new(false);
++static SEQ: AtomicU64 = AtomicU64::new(0);
++static IN_QUEUE: AtomicBool = AtomicBool::new(false);
++static MEMWATCH: AtomicBool = AtomicBool::new(false);
++static LOGGING: AtomicBool = AtomicBool::new(false);
++/// Calls the full log keeps (the first ones).
++const LOG_MAX: usize = 3_000_000;
++/// Changes of watched memory that are kept.
++const MEM_EVENTS_MAX: usize = 3000;
++
++fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
++    m.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++/// The handler in `code` (one function's bytes): its hash, if it has the shape.
++pub fn handler_hash(code: &[u8]) -> Option<u64> {
++    let head = &code[..code.len().min(0x60)];
++    if !head.windows(4).any(|w| w == [0x83, 0x79, 0x10, 0x00]) {
++        return None;
++    }
++    // movabs r64, imm64 ; mov [r64], r64   (the last such pair)
++    let mut found = None;
++    for i in 0..code.len().saturating_sub(12) {
++        let c = &code[i..i + 13];
++        if (c[0] == 0x48 || c[0] == 0x49) && (0xb8..=0xbf).contains(&c[1]) && (c[10] == 0x48 || c[10] == 0x4c) && c[11] == 0x89 && c[12] < 0x40
++        {
++            found = Some(u64::from_le_bytes(c[2..10].try_into().ok()?));
++        }
++    }
++    found
++}
++
++/// Every native handler of the mapped image at `base`: (rva, hash).
++///
++/// # Safety
++/// `base` is a mapped PE image of `size` bytes.
++unsafe fn scan(base: usize, size: usize) -> Vec<(usize, u64)> {
++    // SAFETY: the headers and the function table of a mapped image.
++    unsafe {
++        let rd32 = |at: usize| (at as *const u32).read_unaligned() as usize;
++        let nt = base + rd32(base + 0x3c);
++        // IMAGE_DIRECTORY_ENTRY_EXCEPTION (3) of a PE32+ optional header.
++        let (dir, len) = (rd32(nt + 0x18 + 0x70 + 3 * 8), rd32(nt + 0x18 + 0x70 + 3 * 8 + 4));
++        if dir == 0 || dir + len > size {
++            return Vec::new();
++        }
++        let mut out = Vec::new();
++        for i in 0..len / 12 {
++            let (start, end) = (rd32(base + dir + i * 12), rd32(base + dir + i * 12 + 4));
++            if start == 0 || end <= start || end > size || end - start > 0x4000 {
++                continue;
++            }
++            let code = std::slice::from_raw_parts((base + start) as *const u8, end - start);
++            if let Some(hash) = handler_hash(code) {
++                out.push((start, hash));
++            }
++        }
++        out
++    }
++}
++
++/// Jenkins one-at-a-time over the lower-cased text (RAGE's string hash).
++pub fn joaat(text: &str) -> u32 {
++    let mut h: u32 = 0;
++    for b in text.bytes() {
++        let b = if b == b'\\' { b'/' } else { b.to_ascii_lowercase() };
++        h = h.wrapping_add(u32::from(b));
++        h = h.wrapping_add(h << 10);
++        h ^= h >> 6;
++    }
++    h = h.wrapping_add(h << 3);
++    h ^= h >> 11;
++    h.wrapping_add(h << 15)
++}
++
++/// The stub the patched site calls: `lea rcx, [rsp+0B0h]` (the context: the
++/// title's `[rsp+0A8h]` seen past our return address) ; `mov rdx, r15` (the
++/// handler) ; `mov r8, rbp` (the script context) ; `vzeroupper` ;
++/// `jmp [rip+0]` ; the address of [`dispatch`].
++fn stub_code(dispatch: usize) -> Vec<u8> {
++    let mut c = vec![0x48, 0x8d, 0x8c, 0x24, 0xb0, 0, 0, 0, 0x4c, 0x89, 0xfa, 0x49, 0x89, 0xe8, 0xc5, 0xf8, 0x77, 0xff, 0x25, 0, 0, 0, 0];
++    c.extend(dispatch.to_le_bytes());
++    c
++}
++
++/// The bytes for the site: `call stub` and a nine-byte NOP.
++fn site_code(site: usize, stub: usize) -> Option<[u8; 14]> {
++    let rel = i32::try_from(stub as i64 - (site as i64 + 5)).ok()?;
++    let mut c = [0xe8, 0, 0, 0, 0, 0x66, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0];
++    c[1..5].copy_from_slice(&rel.to_le_bytes());
++    Some(c)
++}
++
++/// `VICTORY_NATIVES`: finds the handlers and hooks the NATIVE opcode.
++///
++/// # Safety
++/// `base` is the just-mapped title executable of `size` bytes whose original
++/// BLAKE3 is `hash`; no title code has run.
++#[cfg(windows)]
++pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
++    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READ, VirtualProtect};
++    TITLE_BASE.store(base, Ordering::Relaxed);
++    let Ok(mode) = std::env::var(ENV) else { return };
++    if mode.is_empty() || mode == "0" {
++        return;
++    }
++    if !hash.to_hex().starts_with(BUILD_1_0_2_1) {
++        tracing::warn!("{ENV}: not the 1.0.2.1 executable; no natives hook");
++        return;
++    }
++    // SAFETY: the mapped image.
++    let found = unsafe { scan(base, size) };
++    if found.len() != HANDLERS_1_0_2_1 {
++        tracing::warn!(found = found.len(), expected = HANDLERS_1_0_2_1, "{ENV}: an unexpected number of native handlers");
++    }
++    // SAFETY: inside the mapped .text of this exact build.
++    let now = unsafe { std::slice::from_raw_parts((base + SITE) as *const u8, SITE_BYTES.len()) };
++    if now != SITE_BYTES {
++        tracing::warn!(rva = format_args!("{SITE:#x}"), "{ENV}: the NATIVE opcode's call is not the expected bytes; no natives hook");
++        return;
++    }
++    let stub = stub_code(dispatch as *const () as usize);
++    let Some(place) = near_image(base, size, 0x1000) else {
++        tracing::warn!("{ENV}: no memory near the image for the stub; no natives hook");
++        return;
++    };
++    let Some(new) = site_code(base + SITE, place) else {
++        tracing::warn!("{ENV}: the stub is too far from the image; no natives hook");
++        return;
++    };
++    // SAFETY: `place` is a fresh page of ours; the site's bytes were checked.
++    unsafe {
++        std::ptr::copy_nonoverlapping(stub.as_ptr(), place as *mut u8, stub.len());
++        let mut old = 0;
++        VirtualProtect(place as _, 0x1000, PAGE_EXECUTE_READ, &mut old);
++    }
++    let names = read_names();
++    let state = State {
++        base,
++        size,
++        by_hash: found.iter().map(|&(rva, h)| (h, rva)).collect(),
++        by_rva: found.iter().copied().collect(),
++        names,
++        started: Instant::now(),
++        queue: Mutex::new(Queue { next_id: 1, ..Queue::default() }),
++        trace: Mutex::new(Trace::default()),
++    };
++    let names = state.names.len();
++    if STATE.set(state).is_err() {
++        return;
++    }
++    TRACING.store(mode == "trace" || mode == "log", Ordering::Relaxed);
++    LOGGING.store(mode == "log", Ordering::Relaxed);
++    if let Ok(spec) = std::env::var(WATCHMEM_ENV) {
++        match set_memwatch(&spec) {
++            Ok(text) => tracing::info!("{WATCHMEM_ENV}: {text}"),
++            Err(e) => tracing::warn!("{WATCHMEM_ENV}: {e}"),
++        }
++    }
++    // SAFETY: the bytes are the ones checked above; no title code runs yet.
++    if !unsafe { crate::hooks::write((base + SITE) as *mut u8, &new) } {
++        tracing::warn!("{ENV}: the NATIVE opcode's call could not be written");
++        return;
++    }
++    tracing::info!(
++        handlers = found.len(),
++        names,
++        site = format_args!("{SITE:#x}"),
++        old = ?SITE_BYTES,
++        new = ?new,
++        stub = format_args!("{place:#x}"),
++        trace = mode == "trace",
++        "{ENV}: natives hook applied (the NATIVE opcode's call goes through the layer; `ncall` runs natives on the script thread)"
++    );
++}
++
++#[cfg(windows)]
++fn read_names() -> HashMap<String, u64> {
++    let mut names = HashMap::new();
++    let Some(path) = std::env::var_os(NAMES_ENV) else { return names };
++    let Ok(text) = std::fs::read_to_string(&path) else {
++        tracing::warn!(path = %std::path::Path::new(&path).display(), "{NAMES_ENV}: the file could not be read");
++        return names;
++    };
++    for line in text.lines() {
++        let mut w = line.split_whitespace();
++        if let (Some(name), Some(hash)) = (w.next(), w.next()) {
++            if let Some(h) = hash.strip_prefix("0x").and_then(|h| u64::from_str_radix(h, 16).ok()) {
++                names.insert(name.to_ascii_uppercase(), h);
++            }
++        }
++    }
++    names
++}
++
++/// Memory of ours for `len` bytes within 2 GiB of the image (above its
++/// end, else below its start), zeroed; its address, or `None` (for the stubs).
++#[cfg(windows)]
++fn near_image(base: usize, size: usize, len: usize) -> Option<usize> {
++    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
++    const STEP: usize = 0x1_0000;
++    let above = (base + size).next_multiple_of(STEP);
++    let below = base.checked_sub(len.next_multiple_of(STEP))? & !(STEP - 1);
++    let tries = (0..1024).map(|k| above + k * STEP).chain((0..1024).filter_map(|k| below.checked_sub(k * STEP)));
++    for at in tries {
++        // SAFETY: a fresh allocation at an address we only ask for.
++        let got = unsafe { VirtualAlloc(at as *const _, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
++        if got != 0 {
++            return Some(got);
++        }
++    }
++    None
++}
++
++/// A NUL-terminated printable string at `p`, if `p` points at readable memory.
++#[cfg(windows)]
++fn string_at(p: u64) -> Option<String> {
++    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
++    let p = p as usize;
++    if !(0x1_0000..0x7fff_ffff_0000).contains(&p) {
++        return None;
++    }
++    // SAFETY: VirtualQuery only reports on the address.
++    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
++    if unsafe { VirtualQuery(p as _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
++        return None;
++    }
++    if info.State != MEM_COMMIT || info.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0 || info.Protect == 0 {
++        return None;
++    }
++    let end = info.BaseAddress as usize + info.RegionSize;
++    let len = (end - p).min(80);
++    // SAFETY: committed, readable memory up to the region's end.
++    let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
++    let n = bytes.iter().position(|&b| b == 0)?;
++    if n < 3 || !bytes[..n].iter().all(|&b| (0x20..0x7f).contains(&b)) {
++        return None;
++    }
++    Some(String::from_utf8_lossy(&bytes[..n]).into_owned())
++}
++
++/// The running script's program id (`[[sctx+48h]+8]+10h`), 0 if unknown.
++unsafe fn script_id(sctx: usize) -> u32 {
++    if sctx < 0x1_0000 {
++        return 0;
++    }
++    // SAFETY: the interpreter's own context; the same reads it does.
++    unsafe {
++        let frame = ((sctx + 0x48) as *const usize).read_unaligned();
++        if frame < 0x1_0000 {
++            return 0;
++        }
++        let prog = ((frame + 8) as *const usize).read_unaligned();
++        if prog < 0x1_0000 {
++            return 0;
++        }
++        ((prog + 0x10) as *const u32).read_unaligned()
++    }
++}
++
++/// Called by the stub in place of the NATIVE opcode's `call r15`.
++///
++/// # Safety
++/// Called only by the stub, on a title thread inside the interpreter.
++#[cfg(windows)]
++unsafe extern "win64" fn dispatch(ctx: *mut Ctx, handler: usize, sctx: usize) {
++    let Some(st) = STATE.get() else {
++        // SAFETY: the call the title asked for.
++        unsafe { std::mem::transmute::<usize, unsafe extern "win64" fn(*mut Ctx)>(handler)(ctx) };
++        return;
++    };
++    if QUEUED.load(Ordering::Relaxed) != 0 && !IN_QUEUE.swap(true, Ordering::Acquire) {
++        // SAFETY: on a script thread, between two of the script's natives.
++        unsafe { run_queue(st, sctx) };
++        IN_QUEUE.store(false, Ordering::Release);
++    }
++    let memwatch = MEMWATCH.load(Ordering::Relaxed);
++    if memwatch {
++        // SAFETY: the context the interpreter just built.
++        unsafe { mem_check(st, None, sctx) };
++    }
++    let mut sampled = None;
++    if TRACING.load(Ordering::Relaxed) {
++        // SAFETY: the context the interpreter just built.
++        sampled = unsafe { before(st, &*ctx, handler, sctx) };
++    }
++    // SAFETY: the call the title asked for.
++    unsafe { std::mem::transmute::<usize, unsafe extern "win64" fn(*mut Ctx)>(handler)(ctx) };
++    if memwatch {
++        // SAFETY: as above.
++        unsafe { mem_check(st, Some((&*ctx, handler)), sctx) };
++    }
++    if let Some((seq, watched)) = sampled {
++        // SAFETY: as above; the return pointer is the interpreter's stack.
++        let ret = unsafe {
++            if (*ctx).ret.is_null() { Vec::new() } else { std::slice::from_raw_parts((*ctx).ret, ((*ctx).retc as usize).min(4)).to_vec() }
++        };
++        let rva = handler - st.base;
++        let mut t = lock(&st.trace);
++        if LOGGING.load(Ordering::Relaxed) {
++            // The entry is near the end (other threads may have added a few since).
++            if let Some(e) = t.log.iter_mut().rev().take(64).find(|e| e.0 == seq) {
++                e.5 = ret.first().copied().unwrap_or(0);
++            }
++        }
++        if watched {
++            if let Some(s) = t.watched.iter_mut().rev().find(|(r, s)| *r == rva && s.seq == seq) {
++                s.1.ret = ret.clone();
++            }
++        }
++        if let Some(s) = t.stats.get_mut(&rva).and_then(|s| s.samples.iter_mut().find(|s| s.seq == seq)) {
++            s.ret = ret;
++        }
++    }
++}
++
++/// Compares the watched memory with what was last seen and notes what changed: `by` is the native that just
++/// returned (the change happened inside it), `None` = before a native (the change came from elsewhere, since
++/// the previous native call on any thread).
++#[cfg(windows)]
++unsafe fn mem_check(st: &State, by: Option<(&Ctx, usize)>, sctx: usize) {
++    let mut t = lock(&st.trace);
++    let t = &mut *t;
++    for (addr, last) in &mut t.mem {
++        // SAFETY: a range inside the mapped image's data (checked when the watch was set).
++        let now = unsafe { std::slice::from_raw_parts(*addr as *const u8, last.len()) };
++        if now == &last[..] {
++            continue;
++        }
++        let first = last.chunks(4).zip(now.chunks(4)).position(|(a, b)| a != b).unwrap_or(0);
++        let seen = t.mem_seen.entry(*addr + first * 4).or_default();
++        *seen += 1;
++        if t.mem_events.len() < MEM_EVENTS_MAX && *seen <= 16 {
++            let mut diffs = Vec::new();
++            for (i, (a, b)) in last.chunks(4).zip(now.chunks(4)).enumerate() {
++                if a != b && diffs.len() < 10 {
++                    let v = |c: &[u8]| c.iter().rev().map(|x| format!("{x:02x}")).collect::<String>();
++                    diffs.push(format!("+{:#x}: {}->{}", *addr - st.base + i * 4, v(a), v(b)));
++                }
++            }
++            let who = match by {
++                Some((ctx, handler)) => {
++                    let n = (ctx.argc as usize).min(8);
++                    // SAFETY: `argc` slots on the script's stack.
++                    let args: Vec<String> =
++                        if ctx.args.is_null() { Vec::new() } else { unsafe { std::slice::from_raw_parts(ctx.args, n) }.iter().map(|a| fmt_slot(*a)).collect() };
++                    let rva = handler.wrapping_sub(st.base);
++                    format!("in +{rva:#x}\t{:#018x}\t({})", st.by_rva.get(&rva).copied().unwrap_or(0), args.join(" "))
++                }
++                None => "between natives\t\t".to_string(),
++            };
++            // SAFETY: the interpreter's context.
++            let script = unsafe { script_id(sctx) };
++            t.mem_events.push(format!(
++                "{}\t{}ms\tscript {script:#x}\t{who}\t{}",
++                SEQ.load(Ordering::Relaxed),
++                st.started.elapsed().as_millis(),
++                diffs.join(" ")
++            ));
++        }
++        last.copy_from_slice(now);
++    }
++}
++
++/// Sets the memory watch (`off` or ranges).
++#[cfg(windows)]
++fn set_memwatch(spec: &str) -> Result<String, String> {
++    let st = STATE.get().ok_or("the natives hook is off")?;
++    let mut t = lock(&st.trace);
++    if spec == "off" {
++        MEMWATCH.store(false, Ordering::Relaxed);
++        t.mem.clear();
++        return Ok("no memory watched".into());
++    }
++    let ranges = parse_ranges(spec, st.base, st.size)?;
++    // SAFETY: ranges inside the mapped image (checked by `parse_ranges`).
++    t.mem = ranges.iter().map(|&(a, l)| (a, unsafe { std::slice::from_raw_parts(a as *const u8, l) }.to_vec())).collect();
++    MEMWATCH.store(!t.mem.is_empty(), Ordering::Relaxed);
++    Ok(format!("watching {} range(s): every change is noted with the native it happened in (ndump -> natives-memwatch.tsv)", t.mem.len()))
++}
++
++/// Parses `+0x<rva>:<len>[,...]` (the memory watch's ranges; inside the image).
++fn parse_ranges(spec: &str, base: usize, size: usize) -> Result<Vec<(usize, usize)>, String> {
++    let mut out = Vec::new();
++    for part in spec.split(',').filter(|p| !p.is_empty()) {
++        let (a, l) = part.split_once(':').ok_or_else(|| format!("{part}: expected +0x<rva>:<len>"))?;
++        let rva = usize::from_str_radix(a.trim_start_matches('+').trim_start_matches("0x"), 16).map_err(|_| format!("bad rva {a}"))?;
++        let len = if let Some(h) = l.strip_prefix("0x") { usize::from_str_radix(h, 16) } else { l.parse() }.map_err(|_| format!("bad length {l}"))?;
++        if len == 0 || len > 0x10000 || rva.checked_add(len).is_none_or(|end| end > size) {
++            return Err(format!("{part}: outside the image or longer than 0x10000"));
++        }
++        out.push((base + rva, len));
++    }
++    Ok(out)
++}
++
++/// Counts the call; for a native's first calls (and for watched natives)
++/// keeps the arguments. Returns the sample's sequence number if one was kept.
++#[cfg(windows)]
++unsafe fn before(st: &State, ctx: &Ctx, handler: usize, sctx: usize) -> Option<(u64, bool)> {
++    let seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
++    let rva = handler.wrapping_sub(st.base);
++    // SAFETY: the interpreter's context.
++    let script = unsafe { script_id(sctx) };
++    let mut t = lock(&st.trace);
++    *t.scripts.entry(script).or_default() += 1;
++    // SAFETY: no arguments, no failure.
++    *t.threads.entry(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }).or_default() += 1;
++    let watched = !t.watch.is_empty() && t.watch.contains(&rva) && t.watched.len() < WATCH_MAX;
++    let stat = t.stats.entry(rva).or_default();
++    stat.count += 1;
++    if stat.count == 1 {
++        stat.first_seq = seq;
++        stat.argc = ctx.argc;
++        stat.retc = ctx.retc;
++    }
++    let keep = stat.samples.len() < SAMPLES;
++    let logging = LOGGING.load(Ordering::Relaxed) && t.log.len() < LOG_MAX;
++    if logging {
++        let mut a = [0u64; 4];
++        if !ctx.args.is_null() {
++            for i in 0..(ctx.argc as usize).min(4) {
++                // SAFETY: `argc` slots on the script's stack.
++                a[i] = unsafe { ctx.args.add(i).read_unaligned() };
++            }
++        }
++        t.log.push((seq, rva as u32, script, ctx.argc, a, 0));
++    }
++    if !keep && !watched {
++        return if logging { Some((seq, false)) } else { None };
++    }
++    let stat = t.stats.entry(rva).or_default();
++    let n = (ctx.argc as usize).min(12);
++    // SAFETY: `argc` slots on the script's stack.
++    let args: Vec<u64> = if ctx.args.is_null() { Vec::new() } else { unsafe { std::slice::from_raw_parts(ctx.args, n).to_vec() } };
++    let strs = args.iter().enumerate().filter_map(|(i, &a)| string_at(a).map(|s| (i, s))).collect();
++    let sample = Sample { seq, ms: st.started.elapsed().as_millis() as u64, script, args, strs, ret: Vec::new() };
++    if keep {
++        stat.samples.push(sample.clone());
++    }
++    if watched {
++        t.watched.push((rva, sample));
++    }
++    Some((seq, watched))
++}
++
++/// Runs the queued calls (all of them, in order).
++#[cfg(windows)]
++unsafe fn run_queue(st: &State, sctx: usize) {
++    // SAFETY: the interpreter's context.
++    let script = unsafe { script_id(sctx) };
++    loop {
++        let (call, args) = {
++            let mut q = lock(&st.queue);
++            if q.only_script != 0 && q.only_script != script {
++                return;
++            }
++            let Some(call) = q.calls.pop_front() else {
++                QUEUED.store(0, Ordering::Relaxed);
++                return;
++            };
++            QUEUED.store(q.calls.len(), Ordering::Relaxed);
++            let mut args: Vec<u64> = Vec::new();
++            for a in &call.args {
++                match a {
++                    Arg::Val(v) => args.push(*v),
++                    Arg::Var(name, None) => args.extend(q.vars.get(name).cloned().unwrap_or_default()),
++                    Arg::Var(name, Some(i)) => args.push(q.vars.get(name).and_then(|v| v.get(*i)).copied().unwrap_or(0)),
++                }
++            }
++            (call, args)
++        };
++        let argc = args.len();
++        let mut slots = args.clone();
++        slots.resize(argc + 16, 0);
++        let mut ret = [0u64; 16];
++        let mut ctx = Ctx { args: slots.as_mut_ptr(), ret: ret.as_mut_ptr(), argc: argc as u32, retc: call.nret as u32 };
++        tracing::info!(id = call.id, script = format_args!("{script:#x}"), "{ENV}: calling {}", call.text);
++        // SAFETY: a native handler of this image (checked when queued), called
++        // as the interpreter calls it, on a script thread.
++        unsafe { std::mem::transmute::<usize, unsafe extern "win64" fn(*mut Ctx)>(st.base + call.rva)(&mut ctx) };
++        let rets = &ret[..call.nret.clamp(1, 16)];
++        let show = |v: &[u64]| v.iter().map(|x| fmt_slot(*x)).collect::<Vec<_>>().join(" ");
++        let mut text = format!("#{} {} -> ret [{}]", call.id, call.text, show(rets));
++        if call.nret == 2 {
++            let f = |v: u64| f32::from_bits(v as u32);
++            text.push_str(&format!(" vec({:.3}, {:.3}, {:.3})", f(ret[0]), f(ret[0] >> 32), f(ret[1])));
++        }
++        if slots[..argc] != args[..] {
++            text.push_str(&format!(" args after [{}]", show(&slots[..argc])));
++        }
++        text.push_str(&format!(" (script {script:#x})"));
++        tracing::info!("{ENV}: {text}");
++        let mut q = lock(&st.queue);
++        if let Some(name) = call.store {
++            q.vars.insert(name, ret[..call.nret.clamp(1, 16)].to_vec());
++        }
++        q.done.insert(call.id, text);
++    }
++}
++
++/// A slot as hex, with its float reading when that is a plain number.
++fn fmt_slot(v: u64) -> String {
++    let f = f32::from_bits(v as u32);
++    if v >> 32 == 0 && v != 0 && f.is_finite() && (1e-4..1e7).contains(&f.abs()) {
++        format!("{v:#x}({f})")
++    } else {
++        format!("{v:#x}")
++    }
++}
++
++/// Parses one `ncall` argument: `123`, `-5`, `0x1f`, `1.5` (a float),
++/// `s:TEXT` (a pointer to the text), `h:TEXT` (its string hash), `$name`,
++/// `$name.<i>`, `buf:<n>` (a pointer to `n` zeroed 8-byte slots).
++pub fn parse_arg(word: &str) -> Result<Arg, String> {
++    parse_args(word).and_then(|v| if v.len() == 1 { Ok(v[0].clone()) } else { Err(format!("{word} is more than one slot")) })
++}
++
++/// A vector's two slots: x in the low and y in the high half of the first, z in the low half of the second.
++pub fn vec_slots(x: f32, y: f32, z: f32) -> [u64; 2] {
++    [u64::from(x.to_bits()) | u64::from(y.to_bits()) << 32, u64::from(z.to_bits())]
++}
++
++/// As [`parse_arg`], plus `v:<x>,<y>,<z>` (a vector: two slots).
++pub fn parse_args(word: &str) -> Result<Vec<Arg>, String> {
++    if let Some(v) = word.strip_prefix("v:") {
++        let f: Vec<f32> = v.split(',').map(|c| c.parse::<f32>().map_err(|_| format!("bad vector {word}"))).collect::<Result<_, _>>()?;
++        let [x, y, z] = f[..] else { return Err(format!("bad vector {word} (v:x,y,z)")) };
++        return Ok(vec_slots(x, y, z).into_iter().map(Arg::Val).collect());
++    }
++    parse_one(word).map(|a| vec![a])
++}
++
++fn parse_one(word: &str) -> Result<Arg, String> {
++    if let Some(v) = word.strip_prefix('$') {
++        return Ok(match v.split_once('.') {
++            Some((name, i)) => Arg::Var(name.to_string(), Some(i.parse().map_err(|_| format!("bad slot in {word}"))?)),
++            None => Arg::Var(v.to_string(), None),
++        });
++    }
++    if let Some(text) = word.strip_prefix("s:") {
++        let mut bytes = text.replace('~', " ").into_bytes();
++        bytes.push(0);
++        return Ok(Arg::Val(Box::leak(bytes.into_boxed_slice()).as_ptr() as u64));
++    }
++    if let Some(text) = word.strip_prefix("h:") {
++        return Ok(Arg::Val(u64::from(joaat(&text.replace('~', " ")))));
++    }
++    if let Some(n) = word.strip_prefix("buf:") {
++        let n: usize = n.parse().map_err(|_| format!("bad size in {word}"))?;
++        return Ok(Arg::Val(Box::leak(vec![0u64; n.clamp(1, 4096)].into_boxed_slice()).as_ptr() as u64));
++    }
++    if let Some(h) = word.strip_prefix("0x") {
++        return u64::from_str_radix(h, 16).map(Arg::Val).map_err(|_| format!("bad number {word}"));
++    }
++    if word.contains('.') || word.contains('e') {
++        return word.parse::<f32>().map(|f| Arg::Val(u64::from(f.to_bits()))).map_err(|_| format!("bad number {word}"));
++    }
++    // An int is a 32-bit slot (negative ones as their 32-bit pattern); larger values fill the slot.
++    word.parse::<i64>()
++        .map(|v| Arg::Val(if v <= i64::from(u32::MAX) { u64::from(v as u32) } else { v as u64 }))
++        .map_err(|_| format!("bad number {word}"))
++}
++
++fn target(st: &State, word: &str) -> Result<usize, String> {
++    let by_hash = |h: u64| st.by_hash.get(&h).copied().ok_or_else(|| format!("no native with hash {h:#x}"));
++    if let Some(r) = word.strip_prefix("+0x") {
++        let rva = usize::from_str_radix(r, 16).map_err(|_| format!("bad rva {word}"))?;
++        return if st.by_rva.contains_key(&rva) { Ok(rva) } else { Err(format!("{word} is not a native handler")) };
++    }
++    if let Some(h) = word.strip_prefix("0x") {
++        return by_hash(u64::from_str_radix(h, 16).map_err(|_| format!("bad hash {word}"))?);
++    }
++    match st.names.get(&word.to_ascii_uppercase()) {
++        Some(h) => by_hash(*h),
++        None => Err(format!("unknown native {word} (a name of {NAMES_ENV}, 0x<hash> or +0x<rva>)")),
++    }
++}
++
++/// What a debug-channel line did.
++pub enum Reply {
++    /// Not one of ours.
++    NotOurs,
++    /// Done now.
++    Now(Result<String, String>),
++    /// Queued: the results of these calls come later ([`result`]).
++    Queued(Vec<u64>, String),
++}
++
++/// One line of the debug channel (`ncall`, `nstat`, `ntrace`, `ndump`, `nmark`, `nwatch`, `nscript`, `nfind`).
++/// `folder` is where `ndump` writes.
++#[cfg(windows)]
++pub fn command(line: &str, folder: &std::path::Path) -> Reply {
++    let words: Vec<&str> = line.split_whitespace().collect();
++    let Some(&cmd) = words.first() else { return Reply::NotOurs };
++    if !matches!(cmd, "ncall" | "nstat" | "ntrace" | "ndump" | "nmark" | "nwatch" | "nscript" | "nfind" | "nhelp" | "npos" | "ntp" | "ntime" | "nwatchmem" | "nlog") {
++        return Reply::NotOurs;
++    }
++    if cmd == "nhelp" {
++        return Reply::Now(Ok("ncall <NAME|0xhash|+0xrva> [ret=<n>] [><var>] [<arg>...] (args: 12, 0x1f, 1.5, s:TEXT, h:TEXT, $var, $var.<i>, buf:<n>; ~ = space) | \
++            nstat | ntrace on|off | ndump | nmark <label> | nwatch <native>|off | nscript <id>|any | nfind <native> | \
++            nwatchmem +0x<rva>:<len>[,...]|off | nlog [<from call> [<to call>]] (needs VICTORY_NATIVES=log) | npos | ntp <x> <y> <z> | ntime <hh> <mm>"
++            .into()));
++    }
++    let Some(st) = STATE.get() else {
++        return Reply::Now(Err(format!("the natives hook is off (set {ENV}=1 or {ENV}=trace)")));
++    };
++    let args = &words[1..];
++    match cmd {
++        "ncall" => match queue_call(st, args) {
++            Ok((id, text)) => Reply::Queued(vec![id], text),
++            Err(e) => Reply::Now(Err(e)),
++        },
++        // Shorthands over the natives named in the names file (tools/natives-names.txt of the inkVI-dive kit).
++        "npos" | "ntp" | "ntime" => {
++            let lines: Vec<String> = match (cmd, args) {
++                ("npos", _) => vec!["PLAYER_PED_ID ret=2 >_ped".into(), "GET_ENTITY_COORDS ret=2 $_ped 0".into(), "GET_CLOCK_HOURS".into(), "GET_CLOCK_MINUTES".into()],
++                ("ntp", [x, y, z]) => vec![
++                    "PLAYER_PED_ID ret=2 >_ped".into(),
++                    // As the title's own scripts call it: heading 0, no flags, 1, -1.
++                    format!("SET_ENTITY_COORDS $_ped v:{x},{y},{z} 0.0 0 1 -1.0"),
++                    "GET_ENTITY_COORDS ret=2 $_ped 0".into(),
++                ],
++                ("ntime", [h, m]) => vec![format!("SET_CLOCK_TIME {h} {m} 0"), "GET_CLOCK_HOURS".into(), "GET_CLOCK_MINUTES".into()],
++                _ => return Reply::Now(Err("npos | ntp <x> <y> <z> | ntime <hh> <mm>".into())),
++            };
++            let (mut ids, mut texts) = (Vec::new(), Vec::new());
++            for l in &lines {
++                let words: Vec<&str> = l.split_whitespace().collect();
++                match queue_call(st, &words) {
++                    Ok((id, text)) => {
++                        ids.push(id);
++                        texts.push(text);
++                    }
++                    Err(e) => return Reply::Now(Err(e)),
++                }
++            }
++            Reply::Queued(ids, texts.join("\n"))
++        }
++        "nlog" => {
++            let num = |i: usize, d: u64| args.get(i).and_then(|w| w.parse::<u64>().ok()).unwrap_or(d);
++            let (from, to) = (num(0, 0), num(1, u64::MAX));
++            let t = lock(&st.trace);
++            let mut out = String::from("# call\trva\thash\tscript\targc\targs (first four)\tfirst return slot\n");
++            let mut n = 0;
++            for e in t.log.iter().filter(|e| e.0 >= from && e.0 <= to).take(400_000) {
++                let argc = (e.3 as usize).min(4);
++                out.push_str(&format!(
++                    "{}\t+{:#x}\t{:#018x}\t{:#x}\t{}\t({})\t{}\n",
++                    e.0,
++                    e.1,
++                    st.by_rva.get(&(e.1 as usize)).copied().unwrap_or(0),
++                    e.2,
++                    e.3,
++                    e.4[..argc].iter().map(|a| fmt_slot(*a)).collect::<Vec<_>>().join(" "),
++                    fmt_slot(e.5)
++                ));
++                n += 1;
++            }
++            let path = folder.join("natives-log.tsv");
++            Reply::Now(std::fs::write(&path, out).map(|()| format!("{n} of {} logged calls ({from}..{to}) -> {}", t.log.len(), path.display())).map_err(|e| e.to_string()))
++        }
++        "nwatchmem" => Reply::Now(match args.first() {
++            Some(spec) => set_memwatch(spec),
++            None => Err("nwatchmem +0x<rva>:<len>[,...] | off".into()),
++        }),
++        "nstat" => {
++            let q = lock(&st.queue);
++            let t = lock(&st.trace);
++            let mut scripts: Vec<_> = t.scripts.iter().collect();
++            scripts.sort_by(|a, b| b.1.cmp(a.1));
++            Reply::Now(Ok(format!(
++                "natives hook on: {} handlers, {} names, base {:#x}, trace {}, {} native calls seen, {} distinct, queued {}, only script {:#x}, vars {:?}\nthreads (id:calls): {}\nscripts by calls: {}",
++                st.by_rva.len(),
++                st.names.len(),
++                st.base,
++                TRACING.load(Ordering::Relaxed),
++                SEQ.load(Ordering::Relaxed),
++                t.stats.len(),
++                q.calls.len(),
++                q.only_script,
++                q.vars.iter().map(|(k, v)| format!("{k}={v:x?}")).collect::<Vec<_>>(),
++                t.threads.iter().map(|(k, v)| format!("{k:#x}:{v}")).collect::<Vec<_>>().join(" "),
++                scripts.iter().take(40).map(|(s, n)| format!("{s:#x}:{n}")).collect::<Vec<_>>().join(" ")
++            )))
++        }
++        "ntrace" => {
++            let on = args.first() == Some(&"on");
++            TRACING.store(on, Ordering::Relaxed);
++            Reply::Now(Ok(format!("trace {}", if on { "on" } else { "off" })))
++        }
++        "nmark" => {
++            mark(&args.join(" "));
++            Reply::Now(Ok(format!("mark at call {}", SEQ.load(Ordering::Relaxed))))
++        }
++        "nwatch" => {
++            let mut t = lock(&st.trace);
++            if args.first() == Some(&"off") {
++                t.watch.clear();
++                return Reply::Now(Ok("no native watched".into()));
++            }
++            for w in args {
++                match target(st, w) {
++                    Ok(r) => t.watch.push(r),
++                    Err(e) => return Reply::Now(Err(e)),
++                }
++            }
++            Reply::Now(Ok(format!("watching {:x?} (needs the trace on)", t.watch)))
++        }
++        "nscript" => {
++            let id = match args.first() {
++                Some(&"any") | None => 0,
++                Some(w) => match u32::from_str_radix(w.trim_start_matches("0x"), 16) {
++                    Ok(v) => v,
++                    Err(_) => return Reply::Now(Err(format!("bad script id {w}"))),
++                },
++            };
++            lock(&st.queue).only_script = id;
++            Reply::Now(Ok(format!("queued calls run in script {id:#x} (0 = any)")))
++        }
++        "nfind" => Reply::Now(args.first().ok_or_else(|| "nfind <native>".to_string()).and_then(|w| target(st, w)).map(|rva| {
++            let t = lock(&st.trace);
++            let seen = t.stats.get(&rva).map_or("not called yet (or no trace)".to_string(), |s| format!("{} calls, argc {}, retc {}", s.count, s.argc, s.retc));
++            format!("+{rva:#x} hash {:#018x}: {seen}", st.by_rva[&rva])
++        })),
++        _ => Reply::Now(dump(st, folder)),
++    }
++}
++
++/// Queues one call: `<native> [ret=<n>] [><var>] [<arg>...]`.
++fn queue_call(st: &State, args: &[&str]) -> Result<(u64, String), String> {
++    let name = args.first().ok_or("ncall <native> [ret=<n>] [><var>] [<arg>...]")?;
++    let rva = target(st, name)?;
++    let (mut nret, mut store, mut parsed) = (1usize, None, Vec::new());
++    for w in &args[1..] {
++        if let Some(n) = w.strip_prefix("ret=") {
++            nret = n.parse::<usize>().ok().filter(|n| *n <= 16).ok_or_else(|| format!("bad {w}"))?;
++        } else if let Some(v) = w.strip_prefix('>') {
++            store = Some(v.to_string());
++        } else {
++            parsed.extend(parse_args(w)?);
++        }
++    }
++    let mut q = lock(&st.queue);
++    let id = q.next_id;
++    q.next_id += 1;
++    let text = format!("{name} (+{rva:#x}, hash {:#018x}) {}", st.by_rva[&rva], args[1..].join(" "));
++    q.calls.push_back(Call { id, rva, args: parsed, nret, store, text: text.clone() });
++    QUEUED.store(q.calls.len(), Ordering::Relaxed);
++    Ok((id, format!("queued #{id}: {text}")))
++}
++
++/// A mark in the trace (the debug channel marks world frames).
++pub fn mark(label: &str) {
++    if let Some(st) = STATE.get() {
++        if TRACING.load(Ordering::Relaxed) {
++            lock(&st.trace).marks.push((SEQ.load(Ordering::Relaxed), label.to_string()));
++        }
++    }
++}
++
++/// The finished result of queued call `id`, once.
++pub fn result(id: u64) -> Option<String> {
++    lock(&STATE.get()?.queue).done.remove(&id)
++}
++
++fn fmt_sample(s: &Sample) -> String {
++    let args = s
++        .args
++        .iter()
++        .enumerate()
++        .map(|(i, a)| match s.strs.iter().find(|(j, _)| *j == i) {
++            Some((_, text)) => format!("\"{text}\""),
++            None => fmt_slot(*a),
++        })
++        .collect::<Vec<_>>()
++        .join(" ");
++    let ret = if s.ret.is_empty() { String::new() } else { format!(" -> {}", s.ret.iter().map(|r| fmt_slot(*r)).collect::<Vec<_>>().join(" ")) };
++    format!("#{} t={}ms script={:#x} ({}){}", s.seq, s.ms, s.script, args, ret)
++}
++
++/// Writes `natives-trace.tsv` (one line per native seen, in order of first
++/// call, with the marks between them) and `natives-watch.tsv`.
++fn dump(st: &State, folder: &std::path::Path) -> Result<String, String> {
++    let t = lock(&st.trace);
++    let mut rows: Vec<(&usize, &Stat)> = t.stats.iter().collect();
++    rows.sort_by_key(|(_, s)| s.first_seq);
++    let mut out = String::from("# rva\thash\tcalls\targc\tretc\tfirst call\tsamples (call number, ms since start, script, args, return)\n");
++    let mut marks = t.marks.iter().peekable();
++    for (rva, s) in &rows {
++        while let Some((seq, label)) = marks.next_if(|(seq, _)| *seq < s.first_seq) {
++            out.push_str(&format!("# mark {label} at call {seq}\n"));
++        }
++        let hash = st.by_rva.get(*rva).copied().unwrap_or(0);
++        let samples = s.samples.iter().map(fmt_sample).collect::<Vec<_>>().join(" | ");
++        out.push_str(&format!("+{rva:#x}\t{hash:#018x}\t{}\t{}\t{}\t{}\t{samples}\n", s.count, s.argc, s.retc, s.first_seq));
++    }
++    for (seq, label) in marks {
++        out.push_str(&format!("# mark {label} at call {seq}\n"));
++    }
++    let path = folder.join("natives-trace.tsv");
++    std::fs::write(&path, out).map_err(|e| format!("{}: {e}", path.display()))?;
++    let mut w = String::from("# rva\thash\tcall\n");
++    for (rva, s) in &t.watched {
++        w.push_str(&format!("+{rva:#x}\t{:#018x}\t{}\n", st.by_rva.get(rva).copied().unwrap_or(0), fmt_sample(s)));
++    }
++    let _ = std::fs::write(folder.join("natives-watch.tsv"), w);
++    if !t.mem_events.is_empty() {
++        let head = "# call number\tms\tscript\twhere (in +rva = during that native; between natives = elsewhere)\thash\targs\tchanged dwords (+rva: old->new)\n";
++        let _ = std::fs::write(folder.join("natives-memwatch.tsv"), format!("{head}{}\n", t.mem_events.join("\n")));
++    }
++    Ok(format!("{} natives seen in {} calls -> {} ({} watched calls -> natives-watch.tsv)", rows.len(), SEQ.load(Ordering::Relaxed), path.display(), t.watched.len()))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_handler_is_known_by_its_shape() {
++        // push rsi ; push rdi ; sub rsp, 28h ; cmp dword [rcx+10h], 0 ; mov rsi, rcx ; js ; ... ;
++        // mov rax, [rsi] ; movabs rcx, hash ; mov [rax], rcx ; jmp
++        let mut code = vec![0x56, 0x57, 0x48, 0x83, 0xec, 0x28, 0x83, 0x79, 0x10, 0x00, 0x48, 0x89, 0xce, 0x78, 0x20];
++        code.extend([0x90; 0x20]);
++        code.extend([0x48, 0x8b, 0x06, 0x48, 0xb9]);
++        code.extend(0xdd3c_edb4_d045_7eddu64.to_le_bytes());
++        code.extend([0x48, 0x89, 0x08, 0xeb, 0xcd]);
++        assert_eq!(handler_hash(&code), Some(0xdd3c_edb4_d045_7edd));
++        // Without the argument-count test it is not a handler.
++        code[6] = 0x90;
++        assert_eq!(handler_hash(&code), None);
++        assert_eq!(handler_hash(&[0xc3]), None);
++    }
++
++    #[test]
++    fn the_stub_and_the_site() {
++        let stub = stub_code(0x1122_3344_5566_7788);
++        // lea rcx, [rsp+0B0h]: the title's [rsp+0A8h] past the return address our call pushed.
++        assert_eq!(stub[..8], [0x48, 0x8d, 0x8c, 0x24, 0xb0, 0, 0, 0]);
++        assert_eq!(stub[stub.len() - 8..], 0x1122_3344_5566_7788u64.to_le_bytes());
++        assert_eq!(stub.len(), 31);
++        let site = site_code(0x1_43de_7503, 0x1_4b10_0000).unwrap();
++        assert_eq!(site.len(), SITE_BYTES.len());
++        assert_eq!(site[0], 0xe8);
++        let rel = i32::from_le_bytes(site[1..5].try_into().unwrap());
++        assert_eq!(0x1_43de_7503i64 + 5 + i64::from(rel), 0x1_4b10_0000);
++        assert!(site_code(0x1_43de_7503, 0x7_0000_0000).is_none());
++    }
++
++    #[test]
++    fn arguments() {
++        assert_eq!(parse_arg("12"), Ok(Arg::Val(12)));
++        assert_eq!(parse_arg("-1"), Ok(Arg::Val(0xffff_ffff)));
++        assert_eq!(parse_arg("0x1f"), Ok(Arg::Val(0x1f)));
++        assert_eq!(parse_arg("1.5"), Ok(Arg::Val(u64::from(1.5f32.to_bits()))));
++        assert_eq!(parse_arg("$ped"), Ok(Arg::Var("ped".into(), None)));
++        assert_eq!(parse_arg("$ped.1"), Ok(Arg::Var("ped".into(), Some(1))));
++        // x = 1.0 low, y = 2.0 high, then z.
++        assert_eq!(parse_args("v:1,2,-3.5"), Ok(vec![Arg::Val(0x4000_0000_3f80_0000), Arg::Val(0xc060_0000)]));
++        assert!(parse_args("v:1,2").is_err());
++        assert_eq!(parse_ranges("+0x100:0x20,0x200:16", 0x1000, 0x1000), Ok(vec![(0x1100, 0x20), (0x1200, 16)]));
++        assert!(parse_ranges("+0xff0:0x20", 0x1000, 0x1000).is_err());
++        assert_eq!(parse_arg("h:adder"), Ok(Arg::Val(0xb779_a091)));
++        assert!(parse_arg("x").is_err());
++        let Ok(Arg::Val(p)) = parse_arg("s:hello~you") else { panic!() };
++        // SAFETY: the leaked, NUL-terminated text.
++        let text = unsafe { std::ffi::CStr::from_ptr(p as *const _) };
++        assert_eq!(text.to_str(), Ok("hello you"));
++        assert_eq!(fmt_slot(u64::from(2.5f32.to_bits())), "0x40200000(2.5)");
++        assert_eq!(fmt_slot(7), "0x7");
++    }
++}
+diff --git a/crates/victory-loader/src/windows.rs b/crates/victory-loader/src/windows.rs
+index a2e15015d..250bc22c2 100644
+--- a/crates/victory-loader/src/windows.rs
++++ b/crates/victory-loader/src/windows.rs
+@@ -97,6 +97,12 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
+         // SAFETY: just mapped, and no title code has run.
+         unsafe { crate::hooks::set_dt_max(loaded.base(), &loaded.info, secs) };
+     }
++    // LOCAL (octo, inkVI-dive): `VICTORY_NATIVES=1|trace` routes the script interpreter's native calls through the layer.
++    #[cfg(feature = "diagnostics")]
++    if !loaded.info.is_dll() {
++        // SAFETY: just mapped, and no title code has run.
++        unsafe { crate::natives::install(loaded.base(), loaded.info.size_of_image as usize, &prepared.original_hash) };
++    }
+     #[cfg(feature = "diagnostics")]
+     crate::hooks::start_dt_probe(loaded.base(), &prepared.original_hash);
+     tracing::info!(

@@ -1,0 +1,975 @@
+From 010a6a83bb613b69202c7bbd96d5950bddaa4eec Mon Sep 17 00:00:00 2001
+From: Octo <180629317+OctoAlgo@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:30:52 +0100
+Subject: [PATCH 01/11] VICTORY_DEBUG command-file channel (diagnostics build)
+
+A folder
+whose file `cmd` is read every fourth present: peek/poke, scan, findptr, chain/matrix, pos, tp,
+time, bookmarks, @w<N> lines. Replies in reply.txt, log.txt, done.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Kit-Source: own (inkVI-dive)
+Kit-Licence: GPL-3.0
+---
+ crates/victory-gpu/src/debugcmd.rs | 924 +++++++++++++++++++++++++++++
+ crates/victory-gpu/src/lib.rs      |   3 +
+ crates/victory-gpu/src/queue.rs    |   1 +
+ 3 files changed, 928 insertions(+)
+ create mode 100644 crates/victory-gpu/src/debugcmd.rs
+
+diff --git a/crates/victory-gpu/src/debugcmd.rs b/crates/victory-gpu/src/debugcmd.rs
+new file mode 100644
+index 000000000..7b62a0ca0
+--- /dev/null
++++ b/crates/victory-gpu/src/debugcmd.rs
+@@ -0,0 +1,924 @@
++//! LOCAL (octo, inkVI-dive): a command-file channel into the
++//! running title, for the diagnostics build only.
++//!
++//! `VICTORY_DEBUG=<folder>` switches it on. Every fourth present the file
++//! `<folder>\cmd` is looked for; when it is there it is read, removed, and
++//! its lines are run (on the presenting thread, in order). The answers go
++//! to `<folder>\reply.txt` (rewritten per `cmd` file) and are appended to
++//! `<folder>\log.txt`; `<folder>\done` is written when every line of that
++//! `cmd` has run (and removed when the next `cmd` is picked up). A line that
++//! begins with `@w<N>` waits for world frame N (`iterate::world_frame`), so
++//! a run script can act at the same game moment every run.
++//!
++//! Addresses are hexadecimal (`0x...`) or `img+0x<rva>` (the title's image
++//! base plus that offset: the RVA of the static research, whose VAs are
++//! `0x140000000 + rva`). Commands:
++//!  * `base`: the title's image base;
++//!  * `peek <addr> <len>`: a hex dump; `peekf <addr> <n>`: `n` floats;
++//!  * `poke <addr> <hex bytes>`, `pokef <addr> <f> [<f>...]`: writes (the
++//!    pages must be committed and writable);
++//!  * `scan [<zmin> <zmax>]`: every 16-byte-aligned 3x4 transform (three
++//!    orthonormal rows with w = 0, then a position with w = 1) in the
++//!    process's committed read-write memory, written to `scan.txt`; the
++//!    reply has the count and, against the previous scan, the ones whose
++//!    position moved 0.3..50 m with the same address (`movers`): the
++//!    player's matrices while the walk keys are held;
++//!  * `findptr <lo> <hi>`: every aligned 8-byte value in [lo, hi] in that
++//!    memory (who holds a pointer to an object), with `img+` for holders
++//!    inside the title's image: a static global;
++//!  * `chain <addr> [<off>...]`: the player ped is `*(*(*addr + off1) + off2)...`
++//!    (every step dereferences); `matrix <off> [<off>...]`:
++//!    the transforms inside the ped written by `tp` (the first is read by
++//!    `pos`). `VICTORY_DEBUG_CHAIN` / `VICTORY_DEBUG_MATRIX` give the
++//!    defaults (comma-separated);
++//!  * `pos`: the player's position and heading; `tp <x> <y> <z> [<heading>]`;
++//!  * `time <hh> <mm>`: the game clock (the clock struct of the static
++//!    research, `img+0xab5cdc0`: hour +0x10, minute +0x14, second +0x18);
++//!  * `save <name>` / `goto <name>` / `marks`: bookmarks in
++//!    `VICTORY_DEBUG_BOOKMARKS` (default `<folder>\bookmarks.txt`), one per
++//!    line: `name x y z heading pitch hh:mm` (pitch is kept but not yet
++//!    read from the camera);
++//!  * `help`.
++//!
++//! Nothing here calls title code: reads and writes go to memory the title
++//! owns, from the presenting thread, so a write races the game thread (a
++//! torn 16-byte row at worst, re-done by the next `tp`). Only for test
++//! scenes on copies of saves.
++
++use std::fmt::Write as _;
++use std::path::{Path, PathBuf};
++#[cfg(windows)]
++use std::sync::{Mutex, OnceLock};
++
++/// What `scan` and `findptr` look at: committed read-write memory that is
++/// not the image itself (`findptr` includes the image, to see globals).
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub(crate) struct Region {
++    pub base: usize,
++    pub size: usize,
++    pub image: bool,
++}
++
++/// Where the player ped is found and where its transforms are.
++#[derive(Clone, Default, Debug, PartialEq)]
++pub(crate) struct Settings {
++    /// The address of the global pointer, then offsets: each but the last
++    /// is dereferenced after adding.
++    pub chain: Vec<usize>,
++    /// Offsets of 3x4 transforms inside the ped (`pos` reads the first).
++    pub matrix: Vec<usize>,
++}
++
++/// One bookmark line.
++#[derive(Clone, Debug, PartialEq)]
++pub(crate) struct Bookmark {
++    pub name: String,
++    pub pos: [f32; 3],
++    pub heading: f32,
++    pub pitch: f32,
++    pub time: Option<(u32, u32)>,
++}
++
++impl Bookmark {
++    pub(crate) fn parse(line: &str) -> Option<Bookmark> {
++        let mut f = line.split_whitespace();
++        let name = f.next()?.to_string();
++        if name.starts_with('#') {
++            return None;
++        }
++        let mut num = || f.next()?.parse::<f32>().ok();
++        let pos = [num()?, num()?, num()?];
++        let heading = num().unwrap_or(0.0);
++        let pitch = num().unwrap_or(0.0);
++        let time = f.next().and_then(|t| {
++            let (h, m) = t.split_once(':')?;
++            Some((h.parse().ok()?, m.parse().ok()?))
++        });
++        Some(Bookmark { name, pos, heading, pitch, time })
++    }
++
++    pub(crate) fn line(&self) -> String {
++        let mut s = format!(
++            "{} {:.3} {:.3} {:.3} {:.2} {:.2}",
++            self.name, self.pos[0], self.pos[1], self.pos[2], self.heading, self.pitch
++        );
++        if let Some((h, m)) = self.time {
++            let _ = write!(s, " {h:02}:{m:02}");
++        }
++        s
++    }
++}
++
++/// `0x...`, decimal, or `img+0x<rva>` with the title's image base.
++pub(crate) fn parse_addr(s: &str, image: usize) -> Option<usize> {
++    let (base, rest) = match s.strip_prefix("img+") {
++        Some(r) => (image, r),
++        None => (0, s),
++    };
++    let v = match rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
++        Some(h) => usize::from_str_radix(h, 16).ok()?,
++        None => rest.parse().ok()?,
++    };
++    base.checked_add(v)
++}
++
++/// Hex bytes: `01 02 ab` or `0102ab`.
++pub(crate) fn parse_bytes(words: &[&str]) -> Option<Vec<u8>> {
++    let joined: String = words.concat();
++    if joined.is_empty() || !joined.len().is_multiple_of(2) {
++        return None;
++    }
++    (0..joined.len()).step_by(2).map(|i| u8::from_str_radix(&joined[i..i + 2], 16).ok()).collect()
++}
++
++pub(crate) fn hexdump(addr: usize, bytes: &[u8]) -> String {
++    let mut s = String::new();
++    for (i, row) in bytes.chunks(16).enumerate() {
++        let _ = write!(s, "{:#018x}:", addr + i * 16);
++        for b in row {
++            let _ = write!(s, " {b:02x}");
++        }
++        let _ = writeln!(s);
++    }
++    s
++}
++
++fn f32s(bytes: &[u8]) -> Vec<f32> {
++    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
++}
++
++fn dot(a: &[f32], b: &[f32]) -> f32 {
++    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
++}
++
++/// Whether 16 floats are a RAGE-style transform: three orthonormal rows
++/// (right, forward, up) with w = 0 and a position with w = 1 inside
++/// `[zmin, zmax]` and within 20 km of the origin, and not the identity at
++/// the origin (an unused matrix).
++pub(crate) fn is_transform(m: &[f32], zmin: f32, zmax: f32) -> bool {
++    if m.len() < 16 || m.iter().any(|v| !v.is_finite()) {
++        return false;
++    }
++    let (a, b, c, d) = (&m[0..4], &m[4..8], &m[8..12], &m[12..16]);
++    if a[3] != 0.0 || b[3] != 0.0 || c[3] != 0.0 || d[3] != 1.0 {
++        return false;
++    }
++    let unit = |r: &[f32]| (dot(r, r) - 1.0).abs() < 0.01;
++    if !(unit(a) && unit(b) && unit(c)) {
++        return false;
++    }
++    if dot(a, b).abs() > 0.02 || dot(a, c).abs() > 0.02 || dot(b, c).abs() > 0.02 {
++        return false;
++    }
++    if d[0].abs() > 20_000.0 || d[1].abs() > 20_000.0 || d[2] < zmin || d[2] > zmax {
++        return false;
++    }
++    !(d[0] == 0.0 && d[1] == 0.0 && d[2] == 0.0)
++}
++
++/// Every 16-byte-aligned transform in `bytes` (which starts at `addr`).
++pub(crate) fn find_transforms(addr: usize, bytes: &[u8], zmin: f32, zmax: f32) -> Vec<(usize, [f32; 3])> {
++    let mut out = Vec::new();
++    let skip = addr.wrapping_neg() & 15;
++    let mut i = skip;
++    while i + 64 <= bytes.len() {
++        let m = f32s(&bytes[i..i + 64]);
++        // Cheap test first: the three w = 0 and the w = 1.
++        if m[3] == 0.0 && m[7] == 0.0 && m[11] == 0.0 && m[15] == 1.0 && is_transform(&m, zmin, zmax) {
++            out.push((addr + i, [m[12], m[13], m[14]]));
++        }
++        i += 16;
++    }
++    out
++}
++
++/// Addresses in both scans whose position moved 0.3..50 m.
++pub(crate) fn movers(before: &[(usize, [f32; 3])], after: &[(usize, [f32; 3])]) -> Vec<(usize, [f32; 3], [f32; 3])> {
++    let old: std::collections::HashMap<usize, [f32; 3]> = before.iter().copied().collect();
++    after
++        .iter()
++        .filter_map(|&(at, p)| {
++            let q = *old.get(&at)?;
++            let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
++            (0.3..50.0).contains(&d).then_some((at, q, p))
++        })
++        .collect()
++}
++
++/// Heading in degrees from the forward row: 0 = +y (north), 90 = -x
++/// (west), the GTA convention.
++pub(crate) fn heading_of(forward: &[f32]) -> f32 {
++    let h = (-forward[0]).atan2(forward[1]).to_degrees();
++    if h < 0.0 { h + 360.0 } else { h }
++}
++
++/// The right and forward rows of an upright transform with that heading.
++pub(crate) fn rows_for_heading(heading: f32) -> ([f32; 4], [f32; 4]) {
++    let (s, c) = heading.to_radians().sin_cos();
++    ([c, s, 0.0, 0.0], [-s, c, 0.0, 0.0])
++}
++
++/// Comma-separated addresses/offsets.
++fn parse_list(s: &str, image: usize) -> Option<Vec<usize>> {
++    s.split(',').filter(|w| !w.trim().is_empty()).map(|w| parse_addr(w.trim(), image)).collect()
++}
++
++/// The reply to a command, built by [`Executor`] from pure parts.
++pub(crate) trait Memory {
++    fn image_base(&self) -> usize;
++    fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>>;
++    fn write(&self, addr: usize, bytes: &[u8]) -> bool;
++    fn regions(&self) -> Vec<Region>;
++}
++
++/// Runs command lines against a [`Memory`]; holds the settings, the last
++/// scan and the bookmarks file.
++pub(crate) struct Executor<M: Memory> {
++    pub mem: M,
++    pub settings: Settings,
++    pub bookmarks: PathBuf,
++    pub last_scan: Vec<(usize, [f32; 3])>,
++    pub scan_file: PathBuf,
++}
++
++const CLOCK_RVA: usize = 0xab5cdc0;
++
++impl<M: Memory> Executor<M> {
++    pub(crate) fn new(mem: M, folder: &Path) -> Self {
++        let image = mem.image_base();
++        let env_list = |name: &str| std::env::var(name).ok().and_then(|v| parse_list(&v, image)).unwrap_or_default();
++        let settings = Settings { chain: env_list("VICTORY_DEBUG_CHAIN"), matrix: env_list("VICTORY_DEBUG_MATRIX") };
++        let bookmarks =
++            std::env::var_os("VICTORY_DEBUG_BOOKMARKS").map_or_else(|| folder.join("bookmarks.txt"), PathBuf::from);
++        Executor { mem, settings, bookmarks, last_scan: Vec::new(), scan_file: folder.join("scan.txt") }
++    }
++
++    fn addr(&self, s: &str) -> Result<usize, String> {
++        parse_addr(s, self.mem.image_base()).ok_or_else(|| format!("not an address: {s}"))
++    }
++
++    fn num<T: std::str::FromStr>(s: Option<&&str>, what: &str) -> Result<T, String> {
++        s.and_then(|v| v.parse().ok()).ok_or_else(|| format!("missing or bad {what}"))
++    }
++
++    fn img(&self, addr: usize) -> String {
++        let base = self.mem.image_base();
++        if base != 0 && addr >= base && addr < base + 0x1000_0000 {
++            format!("{addr:#x} (img+{:#x})", addr - base)
++        } else {
++            format!("{addr:#x}")
++        }
++    }
++
++    /// The player ped's address through the chain: `p = *addr; for each
++    /// offset: p = *(p + off)`.
++    fn ped(&self) -> Result<usize, String> {
++        let chain = &self.settings.chain;
++        if chain.is_empty() {
++            return Err("no player chain: `chain <addr> [<off>...]` or VICTORY_DEBUG_CHAIN".into());
++        }
++        let read_ptr = |at: usize, step: usize| -> Result<usize, String> {
++            let b = self.mem.read(at, 8).ok_or_else(|| format!("chain step {step}: {at:#x} unreadable"))?;
++            let p = usize::from_le_bytes(b[..8].try_into().unwrap());
++            if p == 0 { Err(format!("chain step {step}: null pointer at {at:#x}")) } else { Ok(p) }
++        };
++        let mut at = read_ptr(chain[0], 0)?;
++        for (i, &off) in chain.iter().enumerate().skip(1) {
++            at = read_ptr(at.wrapping_add(off), i)?;
++        }
++        Ok(at)
++    }
++
++    fn transform(&self, ped: usize, off: usize) -> Result<Vec<f32>, String> {
++        let b = self.mem.read(ped + off, 64).ok_or_else(|| format!("transform at {:#x} unreadable", ped + off))?;
++        Ok(f32s(&b))
++    }
++
++    fn clock(&self) -> Option<(u32, u32, u32)> {
++        let base = self.mem.image_base();
++        if base == 0 {
++            return None;
++        }
++        let b = self.mem.read(base + CLOCK_RVA + 0x10, 12)?;
++        let v: Vec<u32> = b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
++        Some((v[0], v[1], v[2]))
++    }
++
++    fn set_clock(&self, h: u32, m: u32) -> Result<String, String> {
++        if h > 23 || m > 59 {
++            return Err("time: hh 0..23, mm 0..59".into());
++        }
++        let base = self.mem.image_base();
++        if base == 0 {
++            return Err("the title's image base is unknown".into());
++        }
++        let mut bytes = Vec::new();
++        for v in [h, m, 0] {
++            bytes.extend_from_slice(&v.to_le_bytes());
++        }
++        if self.mem.write(base + CLOCK_RVA + 0x10, &bytes) {
++            Ok(format!("time set to {h:02}:{m:02}:00"))
++        } else {
++            Err("the clock is not writable".into())
++        }
++    }
++
++    fn position(&self) -> Result<(usize, Vec<f32>), String> {
++        let ped = self.ped()?;
++        let off = *self.settings.matrix.first().ok_or("no matrix offset: `matrix <off>` or VICTORY_DEBUG_MATRIX")?;
++        let m = self.transform(ped, off)?;
++        Ok((ped, m))
++    }
++
++    fn teleport(&self, pos: [f32; 3], heading: Option<f32>) -> Result<String, String> {
++        let ped = self.ped()?;
++        if self.settings.matrix.is_empty() {
++            return Err("no matrix offset: `matrix <off> [<off>...]`".into());
++        }
++        let mut done = Vec::new();
++        for &off in &self.settings.matrix {
++            let mut m = self.transform(ped, off)?;
++            if !is_transform(&m, -10_000.0, 10_000.0) {
++                return Err(format!("{:#x}: not a transform (bad matrix offset {off:#x})", ped + off));
++            }
++            m[12] = pos[0];
++            m[13] = pos[1];
++            m[14] = pos[2];
++            if let Some(h) = heading {
++                let (a, b) = rows_for_heading(h);
++                m[..4].copy_from_slice(&a);
++                m[4..8].copy_from_slice(&b);
++                m[8..12].copy_from_slice(&[0.0, 0.0, 1.0, 0.0]);
++            }
++            let bytes: Vec<u8> = m.iter().flat_map(|v| v.to_le_bytes()).collect();
++            if !self.mem.write(ped + off, &bytes) {
++                return Err(format!("{:#x} not writable", ped + off));
++            }
++            done.push(format!("{:#x}", ped + off));
++        }
++        Ok(format!("teleported to {:.3} {:.3} {:.3}{} (rows at {})", pos[0], pos[1], pos[2],
++            heading.map(|h| format!(" heading {h:.1}")).unwrap_or_default(), done.join(", ")))
++    }
++
++    fn read_bookmarks(&self) -> Vec<Bookmark> {
++        std::fs::read_to_string(&self.bookmarks)
++            .unwrap_or_default()
++            .lines()
++            .filter_map(Bookmark::parse)
++            .collect()
++    }
++
++    /// Runs one line; the reply has no trailing newline.
++    pub(crate) fn run(&mut self, line: &str) -> String {
++        match self.run_inner(line) {
++            Ok(s) => s,
++            Err(e) => format!("error: {e}"),
++        }
++    }
++
++    fn run_inner(&mut self, line: &str) -> Result<String, String> {
++        let words: Vec<&str> = line.split_whitespace().collect();
++        let Some(&cmd) = words.first() else { return Ok(String::new()) };
++        let args = &words[1..];
++        match cmd {
++            "help" => Ok("base | peek <addr> <len> | peekf <addr> <n> | poke <addr> <hex> | pokef <addr> <f>... | \
++                scan [<zmin> <zmax>] | findptr <lo> <hi> | chain <addr> [<off>...] | matrix <off>... | pos | \
++                tp <x> <y> <z> [<heading>] | time <hh> <mm> | save <name> | goto <name> | marks | settings"
++                .into()),
++            "base" => {
++                let b = self.mem.image_base();
++                if b == 0 { Err("the title's image base is unknown".into()) } else { Ok(format!("image base {b:#x}")) }
++            }
++            "settings" => Ok(format!(
++                "chain {:?} matrix {:?} bookmarks {}",
++                self.settings.chain.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>(),
++                self.settings.matrix.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>(),
++                self.bookmarks.display()
++            )),
++            "peek" => {
++                let addr = self.addr(args.first().ok_or("peek <addr> <len>")?)?;
++                let len: usize = Self::num(args.get(1), "length")?;
++                let len = len.min(0x10000);
++                let b = self.mem.read(addr, len).ok_or_else(|| format!("{} unreadable", self.img(addr)))?;
++                Ok(format!("{}\n{}", self.img(addr), hexdump(addr, &b).trim_end()))
++            }
++            "peekf" => {
++                let addr = self.addr(args.first().ok_or("peekf <addr> <n>")?)?;
++                let n: usize = Self::num(args.get(1), "count")?;
++                let b = self.mem.read(addr, n.min(4096) * 4).ok_or_else(|| format!("{} unreadable", self.img(addr)))?;
++                let mut s = self.img(addr);
++                for (i, row) in f32s(&b).chunks(4).enumerate() {
++                    let _ = write!(s, "\n{:#x}:", addr + i * 16);
++                    for v in row {
++                        let _ = write!(s, " {v:.4}");
++                    }
++                }
++                Ok(s)
++            }
++            "poke" => {
++                let addr = self.addr(args.first().ok_or("poke <addr> <hex bytes>")?)?;
++                let bytes = parse_bytes(&args[1..]).ok_or("poke: hex bytes expected")?;
++                if self.mem.write(addr, &bytes) { Ok(format!("wrote {} bytes at {}", bytes.len(), self.img(addr))) } else { Err(format!("{} not writable", self.img(addr))) }
++            }
++            "pokef" => {
++                let addr = self.addr(args.first().ok_or("pokef <addr> <f>...")?)?;
++                let vals: Vec<f32> = args[1..].iter().map(|v| v.parse().map_err(|_| format!("not a float: {v}"))).collect::<Result<_, _>>()?;
++                if vals.is_empty() {
++                    return Err("pokef: floats expected".into());
++                }
++                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
++                if self.mem.write(addr, &bytes) { Ok(format!("wrote {} floats at {}", vals.len(), self.img(addr))) } else { Err(format!("{} not writable", self.img(addr))) }
++            }
++            "chain" => {
++                let image = self.mem.image_base();
++                let chain: Option<Vec<usize>> = args.iter().map(|a| parse_addr(a, image)).collect();
++                self.settings.chain = chain.ok_or("chain: addresses expected")?;
++                Ok(format!("chain set ({} entries)", self.settings.chain.len()))
++            }
++            "matrix" => {
++                let image = self.mem.image_base();
++                let m: Option<Vec<usize>> = args.iter().map(|a| parse_addr(a, image)).collect();
++                self.settings.matrix = m.ok_or("matrix: offsets expected")?;
++                Ok(format!("matrix offsets set ({})", self.settings.matrix.len()))
++            }
++            "pos" => {
++                let (ped, m) = self.position()?;
++                let clock = self.clock().map(|(h, mi, s)| format!(" time {h:02}:{mi:02}:{s:02}")).unwrap_or_default();
++                Ok(format!(
++                    "ped {ped:#x} pos {:.3} {:.3} {:.3} heading {:.1}{clock}{}",
++                    m[12], m[13], m[14], heading_of(&m[4..8]),
++                    if is_transform(&m, -10_000.0, 10_000.0) { "" } else { " (NOT a transform: check the matrix offset)" }
++                ))
++            }
++            "tp" => {
++                let x: f32 = Self::num(args.first(), "x")?;
++                let y: f32 = Self::num(args.get(1), "y")?;
++                let z: f32 = Self::num(args.get(2), "z")?;
++                let h: Option<f32> = args.get(3).map(|v| v.parse().map_err(|_| "bad heading".to_string())).transpose()?;
++                self.teleport([x, y, z], h)
++            }
++            "time" => {
++                let h: u32 = Self::num(args.first(), "hh")?;
++                let m: u32 = Self::num(args.get(1), "mm")?;
++                self.set_clock(h, m)
++            }
++            "save" => {
++                let name = args.first().ok_or("save <name>")?.to_string();
++                let (_, m) = self.position()?;
++                let mark = Bookmark {
++                    name: name.clone(),
++                    pos: [m[12], m[13], m[14]],
++                    heading: heading_of(&m[4..8]),
++                    pitch: 0.0,
++                    time: self.clock().map(|(h, mi, _)| (h, mi)),
++                };
++                let mut marks: Vec<Bookmark> = self.read_bookmarks().into_iter().filter(|b| b.name != name).collect();
++                marks.push(mark.clone());
++                let text: String = marks.iter().map(|b| b.line() + "\n").collect();
++                std::fs::write(&self.bookmarks, text).map_err(|e| format!("bookmarks file: {e}"))?;
++                Ok(format!("saved: {}", mark.line()))
++            }
++            "goto" => {
++                let name = args.first().ok_or("goto <name>")?;
++                let mark = self.read_bookmarks().into_iter().find(|b| b.name == *name).ok_or_else(|| format!("no bookmark {name}"))?;
++                let mut s = self.teleport(mark.pos, Some(mark.heading))?;
++                if let Some((h, m)) = mark.time {
++                    let _ = write!(s, "; {}", self.set_clock(h, m)?);
++                }
++                Ok(s)
++            }
++            "marks" => {
++                let marks = self.read_bookmarks();
++                if marks.is_empty() { Ok(format!("no bookmarks in {}", self.bookmarks.display())) } else { Ok(marks.iter().map(Bookmark::line).collect::<Vec<_>>().join("\n")) }
++            }
++            "scan" => {
++                let zmin: f32 = args.first().map_or(Ok(-500.0), |v| v.parse().map_err(|_| "bad zmin"))?;
++                let zmax: f32 = args.get(1).map_or(Ok(3000.0), |v| v.parse().map_err(|_| "bad zmax"))?;
++                let mut hits = Vec::new();
++                let mut bytes = 0usize;
++                for r in self.mem.regions().into_iter().filter(|r| !r.image) {
++                    // In pieces: a region can be gigabytes.
++                    let mut at = r.base;
++                    let end = r.base + r.size;
++                    while at < end {
++                        let len = (end - at).min(64 << 20);
++                        if let Some(b) = self.mem.read(at, len) {
++                            bytes += b.len();
++                            hits.extend(find_transforms(at, &b, zmin, zmax));
++                        }
++                        at += len;
++                    }
++                }
++                let moved = movers(&self.last_scan, &hits);
++                let mut text = String::new();
++                for (at, p) in &hits {
++                    let _ = writeln!(text, "{at:#x} {:.3} {:.3} {:.3}", p[0], p[1], p[2]);
++                }
++                let _ = std::fs::write(&self.scan_file, text);
++                let mut s = format!("{} transforms in {} MB scanned (z {zmin}..{zmax}), listed in {}; {} movers since the last scan",
++                    hits.len(), bytes >> 20, self.scan_file.display(), moved.len());
++                for (at, q, p) in moved.iter().take(40) {
++                    let _ = write!(s, "\n  {at:#x}: {:.2} {:.2} {:.2} -> {:.2} {:.2} {:.2}", q[0], q[1], q[2], p[0], p[1], p[2]);
++                }
++                self.last_scan = hits;
++                Ok(s)
++            }
++            "findptr" => {
++                let lo = self.addr(args.first().ok_or("findptr <lo> <hi>")?)?;
++                let hi = self.addr(args.get(1).ok_or("findptr <lo> <hi>")?)?;
++                let mut found = Vec::new();
++                for r in self.mem.regions() {
++                    let mut at = r.base;
++                    let end = r.base + r.size;
++                    while at < end && found.len() < 400 {
++                        let len = (end - at).min(64 << 20);
++                        if let Some(b) = self.mem.read(at, len) {
++                            let skip = at.wrapping_neg() & 7;
++                            for (i, c) in b[skip..].chunks_exact(8).enumerate() {
++                                let v = usize::from_le_bytes(c.try_into().unwrap());
++                                if v >= lo && v <= hi {
++                                    found.push((at + skip + i * 8, v, r.image));
++                                }
++                            }
++                        }
++                        at += len;
++                    }
++                }
++                let mut s = format!("{} holders of a value in [{lo:#x}, {hi:#x}]{}", found.len(), if found.len() >= 400 { " (stopped at 400)" } else { "" });
++                for (at, v, image) in found.iter().take(200) {
++                    let _ = write!(s, "\n  {}{} -> {v:#x}", self.img(*at), if *image { " [image]" } else { "" });
++                }
++                Ok(s)
++            }
++            other => Err(format!("unknown command {other} (help)")),
++        }
++    }
++}
++
++/// The lines of a `cmd` file split into those that run now and those that
++/// wait for a world frame (`@w<N> ...`).
++pub(crate) fn schedule(text: &str, world: Option<u64>) -> (Vec<String>, Vec<(u64, String)>) {
++    let mut now = Vec::new();
++    let mut later = Vec::new();
++    for line in text.lines() {
++        let line = line.trim();
++        if line.is_empty() || line.starts_with('#') {
++            continue;
++        }
++        if let Some(rest) = line.strip_prefix("@w") {
++            if let Some((n, cmd)) = rest.split_once(char::is_whitespace) {
++                if let Ok(n) = n.parse::<u64>() {
++                    if world.is_some_and(|w| w >= n) {
++                        now.push(cmd.trim().to_string());
++                    } else {
++                        later.push((n, cmd.trim().to_string()));
++                    }
++                    continue;
++                }
++            }
++        }
++        now.push(line.to_string());
++    }
++    (now, later)
++}
++
++#[cfg(windows)]
++mod live {
++    use super::*;
++    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
++    use windows_sys::Win32::System::Memory::{
++        MEM_COMMIT, MEM_IMAGE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
++        PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
++    };
++
++    pub(super) struct Process;
++
++    fn query(at: usize) -> Option<MEMORY_BASIC_INFORMATION> {
++        // SAFETY: plain data filled in by the query.
++        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
++        // SAFETY: a valid out pointer of the right size.
++        (unsafe { VirtualQuery(at as *const _, &mut m, size_of_val(&m)) } != 0).then_some(m)
++    }
++
++    fn writable(p: u32) -> bool {
++        matches!(p & 0xff, PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
++    }
++
++    /// Whether every page of [addr, addr+len) is committed and readable
++    /// (and writable, if asked).
++    fn accessible(addr: usize, len: usize, write: bool) -> bool {
++        let Some(end) = addr.checked_add(len) else { return false };
++        let mut at = addr;
++        while at < end {
++            let Some(m) = query(at) else { return false };
++            if m.State != MEM_COMMIT || m.Protect & PAGE_GUARD != 0 || m.Protect & 0xff == PAGE_NOACCESS {
++                return false;
++            }
++            if write && !writable(m.Protect) {
++                return false;
++            }
++            at = (m.BaseAddress as usize).saturating_add(m.RegionSize);
++        }
++        true
++    }
++
++    impl Memory for Process {
++        fn image_base(&self) -> usize {
++            static BASE: OnceLock<usize> = OnceLock::new();
++            *BASE.get_or_init(|| {
++                let name = std::env::var("VICTORY_DEBUG_IMAGE").unwrap_or_else(|_| "game_scarlett_master.exe".into());
++                let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
++                // SAFETY: a NUL-terminated name; the handle is only read as a number.
++                let h = unsafe { GetModuleHandleW(wide.as_ptr()) };
++                let base = h as usize;
++                if base == 0 {
++                    tracing::warn!(name, "VICTORY_DEBUG: the title's module was not found; `img+` addresses are unavailable");
++                }
++                base
++            })
++        }
++
++        fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
++            if len == 0 || !accessible(addr, len, false) {
++                return None;
++            }
++            // SAFETY: every page is committed and readable (checked just now; a
++            // concurrent decommit is the diagnostics build's risk).
++            Some(unsafe { std::slice::from_raw_parts(addr as *const u8, len) }.to_vec())
++        }
++
++        fn write(&self, addr: usize, bytes: &[u8]) -> bool {
++            if bytes.is_empty() || !accessible(addr, bytes.len(), true) {
++                return false;
++            }
++            // SAFETY: committed and writable (checked just now).
++            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
++            true
++        }
++
++        fn regions(&self) -> Vec<Region> {
++            let mut out = Vec::new();
++            let mut at = 0usize;
++            while let Some(m) = query(at) {
++                let next = (m.BaseAddress as usize).saturating_add(m.RegionSize);
++                if m.State == MEM_COMMIT && m.Protect & PAGE_GUARD == 0 && writable(m.Protect) {
++                    out.push(Region { base: m.BaseAddress as usize, size: m.RegionSize, image: m.Type == MEM_IMAGE });
++                }
++                if next <= at {
++                    break;
++                }
++                at = next;
++            }
++            out
++        }
++    }
++}
++
++#[cfg(windows)]
++struct Channel {
++    folder: PathBuf,
++    exec: Executor<live::Process>,
++    later: Vec<(u64, String)>,
++    /// Lines run for the current `cmd` so far (for `done`).
++    replies: Vec<String>,
++}
++
++#[cfg(windows)]
++fn channel() -> Option<&'static Mutex<Channel>> {
++    static CHANNEL: OnceLock<Option<Mutex<Channel>>> = OnceLock::new();
++    CHANNEL
++        .get_or_init(|| {
++            let folder = PathBuf::from(std::env::var_os("VICTORY_DEBUG")?);
++            if !folder.is_absolute() {
++                tracing::warn!(folder = %folder.display(), "VICTORY_DEBUG is not a full path: no command channel");
++                return None;
++            }
++            if let Err(e) = std::fs::create_dir_all(&folder) {
++                tracing::warn!(error = %e, folder = %folder.display(), "the VICTORY_DEBUG folder could not be made: no command channel");
++                return None;
++            }
++            let exec = Executor::new(live::Process, &folder);
++            tracing::info!(folder = %folder.display(), base = format_args!("{:#x}", exec.mem.image_base()), ?exec.settings,
++                "debug command channel on (VICTORY_DEBUG): lines of the file `cmd` run every fourth present; replies in reply.txt");
++            Some(Mutex::new(Channel { folder, exec, later: Vec::new(), replies: Vec::new() }))
++        })
++        .as_ref()
++}
++
++/// At the present of `frame`, on the thread that presents.
++#[cfg(windows)]
++pub(crate) fn present(frame: u64) {
++    let Some(ch) = channel() else { return };
++    let mut ch = ch.lock().unwrap_or_else(|e| e.into_inner());
++    let world = crate::iterate::world_frame();
++    let mut run_now: Vec<String> = Vec::new();
++    if !ch.later.is_empty() {
++        let (due, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut ch.later).into_iter().partition(|(n, _)| world.is_some_and(|w| w >= *n));
++        ch.later = wait;
++        run_now.extend(due.into_iter().map(|(_, c)| c));
++    }
++    let mut new_cmd = false;
++    if frame.is_multiple_of(4) {
++        let cmd = ch.folder.join("cmd");
++        if let Ok(text) = std::fs::read_to_string(&cmd) {
++            match std::fs::remove_file(&cmd) {
++                Ok(()) => {
++                    let _ = std::fs::remove_file(ch.folder.join("done"));
++                    ch.replies.clear();
++                    new_cmd = true;
++                    let (now, later) = schedule(&text, world);
++                    run_now.extend(now);
++                    ch.later.extend(later);
++                }
++                Err(e) => tracing::warn!(error = %e, "VICTORY_DEBUG: `cmd` could not be removed; not run"),
++            }
++        }
++    }
++    if run_now.is_empty() && !new_cmd {
++        return;
++    }
++    let stamp = format!("present {frame} world {}", world.map_or("-".to_string(), |w| w.to_string()));
++    for line in run_now {
++        let began = std::time::Instant::now();
++        let reply = ch.exec.run(&line);
++        let ms = began.elapsed().as_millis();
++        tracing::info!(cmd = %line, ms, "VICTORY_DEBUG: {}", reply.lines().next().unwrap_or(""));
++        ch.replies.push(format!("[{stamp}] > {line}\n{reply}\n"));
++    }
++    let text: String = ch.replies.concat();
++    let _ = std::fs::write(ch.folder.join("reply.txt"), &text);
++    if let Ok(mut log) = std::fs::OpenOptions::new().append(true).create(true).open(ch.folder.join("log.txt")) {
++        use std::io::Write as _;
++        let _ = log.write_all(text.as_bytes());
++    }
++    if ch.later.is_empty() {
++        let _ = std::fs::write(ch.folder.join("done"), format!("{stamp}\n"));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::cell::RefCell;
++    use std::collections::HashMap;
++
++    /// A fake process: one 4 KB page of memory at 0x10000 (read-write),
++    /// an "image" at 0x140000000 holding a global pointer and the clock.
++    struct Fake {
++        pages: RefCell<HashMap<usize, Vec<u8>>>,
++    }
++    const HEAP: usize = 0x10000;
++    const IMAGE: usize = 0x1_4000_0000;
++    impl Fake {
++        fn new() -> Fake {
++            let mut pages = HashMap::new();
++            pages.insert(HEAP, vec![0u8; 0x1000]);
++            pages.insert(IMAGE, vec![0u8; 0xb00_0000]);
++            Fake { pages: RefCell::new(pages) }
++        }
++        fn put(&self, addr: usize, bytes: &[u8]) {
++            assert!(self.write(addr, bytes), "{addr:#x}");
++        }
++    }
++    impl Memory for Fake {
++        fn image_base(&self) -> usize {
++            IMAGE
++        }
++        fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
++            let pages = self.pages.borrow();
++            let (&base, page) = pages.iter().find(|&(b, p)| addr >= *b && addr + len <= *b + p.len())?;
++            Some(page[addr - base..addr - base + len].to_vec())
++        }
++        fn write(&self, addr: usize, bytes: &[u8]) -> bool {
++            let mut pages = self.pages.borrow_mut();
++            let Some((&base, _)) = pages.iter().find(|&(b, p)| addr >= *b && addr + bytes.len() <= *b + p.len()) else { return false };
++            pages.get_mut(&base).unwrap()[addr - base..addr - base + bytes.len()].copy_from_slice(bytes);
++            true
++        }
++        fn regions(&self) -> Vec<Region> {
++            vec![Region { base: HEAP, size: 0x1000, image: false }, Region { base: IMAGE, size: 0x1000, image: true }]
++        }    }
++
++    fn matrix(pos: [f32; 3], heading: f32) -> Vec<u8> {
++        let (a, b) = rows_for_heading(heading);
++        let m: Vec<f32> = [a.as_slice(), b.as_slice(), &[0.0, 0.0, 1.0, 0.0], &[pos[0], pos[1], pos[2], 1.0]].concat();
++        m.iter().flat_map(|v| v.to_le_bytes()).collect()
++    }
++
++    fn executor(dir: &Path) -> Executor<Fake> {
++        let fake = Fake::new();
++        // The ped object at HEAP+0x100 with its transform at +0x60; the
++        // global at img+0x100 points to a holder at HEAP+0x800 whose +8 is
++        // the ped (a two-step chain).
++        fake.put(HEAP + 0x160, &matrix([100.0, 200.0, 30.0], 90.0));
++        fake.put(IMAGE + 0x100, &(HEAP + 0x800).to_le_bytes());
++        fake.put(HEAP + 0x808, &(HEAP + 0x100).to_le_bytes());
++        for (i, v) in [7u32, 45, 12].iter().enumerate() {
++            fake.put(IMAGE + CLOCK_RVA + 0x10 + i * 4, &v.to_le_bytes());
++        }
++        let mut e = Executor::new(fake, dir);
++        e.settings = Settings { chain: vec![IMAGE + 0x100, 0x8], matrix: vec![0x60] };
++        e
++    }
++
++    #[test]
++    fn addresses() {
++        assert_eq!(parse_addr("0x10", 0), Some(16));
++        assert_eq!(parse_addr("16", 0), Some(16));
++        assert_eq!(parse_addr("img+0xab5cdc0", 0x1_4000_0000), Some(0x14ab5cdc0));
++        assert_eq!(parse_addr("img+", 1), None);
++        assert_eq!(parse_addr("zz", 0), None);
++        assert_eq!(parse_bytes(&["01", "ab"]), Some(vec![1, 0xab]));
++        assert_eq!(parse_bytes(&["01ab"]), Some(vec![1, 0xab]));
++        assert_eq!(parse_bytes(&["1"]), None);
++    }
++
++    #[test]
++    fn transforms_and_headings() {
++        let m = f32s(&matrix([1.0, 2.0, 3.0], 90.0));
++        assert!(is_transform(&m, -500.0, 3000.0));
++        assert!((heading_of(&m[4..8]) - 90.0).abs() < 1e-3);
++        let m0 = f32s(&matrix([1.0, 2.0, 3.0], 0.0));
++        assert!(heading_of(&m0[4..8]).abs() < 1e-3);
++        assert!(!is_transform(&f32s(&matrix([0.0, 0.0, 0.0], 0.0)), -500.0, 3000.0), "identity at the origin");
++        assert!(!is_transform(&f32s(&matrix([1.0, 2.0, 5000.0], 0.0)), -500.0, 3000.0), "z out of range");
++        let mut skew = m.clone();
++        skew[0] = 0.7;
++        assert!(!is_transform(&skew, -500.0, 3000.0));
++        // find_transforms honours alignment and reports positions
++        let mut bytes = vec![0u8; 32];
++        bytes.extend(matrix([5.0, 6.0, 7.0], 180.0));
++        bytes.extend(vec![0u8; 16]);
++        let hits = find_transforms(0x1000, &bytes, -500.0, 3000.0);
++        assert_eq!(hits, vec![(0x1020, [5.0, 6.0, 7.0])]);
++        let moved = movers(&hits, &[(0x1020, [6.0, 6.0, 7.0]), (0x2000, [1.0, 1.0, 1.0])]);
++        assert_eq!(moved.len(), 1);
++        assert!(movers(&hits, &[(0x1020, [5.0, 6.0, 7.1])]).is_empty(), "jitter is not a move");
++    }
++
++    #[test]
++    fn bookmarks() {
++        let b = Bookmark::parse("cell 12.5 -3 4 270 -5.5 07:45").unwrap();
++        assert_eq!(b.name, "cell");
++        assert_eq!(b.time, Some((7, 45)));
++        assert_eq!(Bookmark::parse(&b.line()), Some(b.clone()));
++        assert_eq!(Bookmark::parse("# comment 1 2 3"), None);
++        assert_eq!(Bookmark::parse("short 1 2").is_none(), true);
++        let no_time = Bookmark::parse("x 1 2 3").unwrap();
++        assert_eq!(no_time.time, None);
++        assert_eq!(no_time.line(), "x 1.000 2.000 3.000 0.00 0.00");
++    }
++
++    #[test]
++    fn scheduling() {
++        let (now, later) = schedule("pos\n# c\n@w900 tp 1 2 3\n@w600 time 7 0\n\n@bad\n", Some(700));
++        assert_eq!(now, vec!["pos", "time 7 0", "@bad"]);
++        assert_eq!(later, vec![(900, "tp 1 2 3".to_string())]);
++        let (now, later) = schedule("@w5 pos", None);
++        assert!(now.is_empty());
++        assert_eq!(later.len(), 1);
++    }
++
++    #[test]
++    fn commands_against_a_fake_process() {
++        let dir = std::env::temp_dir().join(format!("victory-debugcmd-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        let mut e = executor(&dir);
++        assert_eq!(e.run("base"), format!("image base {IMAGE:#x}"));
++        assert_eq!(e.run("pos"), format!("ped {:#x} pos 100.000 200.000 30.000 heading 90.0 time 07:45:12", HEAP + 0x100));
++        assert!(e.run("peek img+0x100 8").contains("00 08 01 00 00 00 00 00"), "{}", e.run("peek img+0x100 8"));
++        assert!(e.run("peek 0x1 8").starts_with("error"));
++        assert!(e.run("peekf 0x10190 4").ends_with("100.0000 200.0000 30.0000 1.0000"));
++        assert!(e.run("tp 1 2 3 180").starts_with("teleported to 1.000 2.000 3.000 heading 180.0"));
++        assert!(e.run("pos").contains("pos 1.000 2.000 3.000 heading 180.0"));
++        assert_eq!(e.run("time 23 59"), "time set to 23:59:00");
++        assert!(e.run("time 24 0").starts_with("error"));
++        assert!(e.run("pos").ends_with("time 23:59:00"));
++        assert!(e.run("save here").starts_with("saved: here 1.000 2.000 3.000 180.00 0.00 23:59"));
++        assert!(e.run("tp 50 60 70").starts_with("teleported"));
++        assert!(e.run("time 6 30").starts_with("time set"));
++        let g = e.run("goto here");
++        assert!(g.starts_with("teleported to 1.000 2.000 3.000 heading 180.0") && g.ends_with("; time set to 23:59:00"), "{g}");
++        assert!(e.run("goto nowhere").starts_with("error: no bookmark"));
++        assert_eq!(e.run("marks"), "here 1.000 2.000 3.000 180.00 0.00 23:59");
++        // scan finds the one transform in the heap page; a second scan after a move lists it as a mover
++        let s = e.run("scan");
++        assert!(s.starts_with("1 transforms in"), "{s}");
++        assert!(e.run("tp 3 2 3").starts_with("teleported"));
++        let s = e.run("scan");
++        assert!(s.contains("1 movers") && s.contains(&format!("{:#x}: 1.00 2.00 3.00 -> 3.00 2.00 3.00", HEAP + 0x160)), "{s}");
++        // findptr sees the holder in the heap and the global in the image
++        let f = e.run(&format!("findptr {:#x} {:#x}", HEAP + 0x100, HEAP + 0x100));
++        assert!(f.contains(&format!("{:#x} -> {:#x}", HEAP + 0x808, HEAP + 0x100)), "{f}");
++        let f = e.run(&format!("findptr {:#x} {:#x}", HEAP + 0x800, HEAP + 0x800));
++        assert!(f.contains("(img+0x100) [image]"), "{f}");
++        assert!(e.run("poke 0x10000 de ad").starts_with("wrote 2 bytes"));
++        assert_eq!(e.mem.read(HEAP, 2), Some(vec![0xde, 0xad]));
++        assert!(e.run("pokef 0x10000 1.5").starts_with("wrote 1 floats"));
++        assert!(e.run("chain img+0x100 8").starts_with("chain set"));
++        assert!(e.run("matrix 0x60").starts_with("matrix offsets set"));
++        assert!(e.run("nonsense").starts_with("error: unknown"));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++}
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index bf9f09509..922f9f7ec 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -25,6 +25,9 @@ mod cardmeter;
+ mod renderdoc;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod shot;
++// LOCAL (octo, inkVI-dive): `VICTORY_DEBUG` command-file channel (pos/tp/time/peek, bookmarks).
++#[cfg(feature = "diagnostics")]
++mod debugcmd;
+ pub mod console;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod copystat;
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+index 1e48f2ccc..5e16ab138 100644
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -1960,6 +1960,7 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane, _paramet
+         crate::capture::frame_drew(frame, crate::draw::drawn());
+         crate::renderdoc::frame_drew(frame, crate::draw::drawn());
+         crate::shot::present(frame, crate::draw::drawn());
++        crate::debugcmd::present(frame);
+         if crate::capture::listed(frame) {
+             crate::capture::dump_targets(frame);
+         }

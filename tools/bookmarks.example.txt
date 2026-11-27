@@ -1,0 +1,9 @@
+# bookmarks.example.txt: teleport bookmarks for `tpsave` / `tpgo` / `tpmarks` (VICTORY_DEBUG_BOOKMARKS=<this file>).
+# One line per bookmark: name x y z heading pitch [hh:mm]   (heading in degrees: 0 = +y / north, 90 = -x / west;
+# hh:mm optional: tpgo also sets the clock). Lines starting with # are kept. Edit by hand freely.
+# Prison cell checkpoint (Lucia at the window):
+cell -2755.401 -2914.841 12.284 1.36 0.00 07:30
+# Chapter 1 opening: the dock after the montage, and the iguana shot's still camera (do not tp there during the
+# mission: a far teleport fails it, see the README):
+dock -1766.261 -4374.803 -0.151 153.33 0.00 14:04
+iguana -2367.200 -4399.400 1.900 0.00 0.00 14:04

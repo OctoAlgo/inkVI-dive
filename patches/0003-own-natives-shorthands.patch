@@ -1,0 +1,640 @@
+From 9d7f25cf0c23bbc7afb2aff5c1d29b9cdef5b370 Mon Sep 17 00:00:00 2001
+From: Octo <180629317+OctoAlgo@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 09:29:58 +0100
+Subject: [PATCH 03/11] pos, tp, time, date and teleport bookmarks through the
+ title's own natives; by-ID call hook
+
+Debug channel, with VICTORY_NATIVES on (names from VICTORY_NATIVES_NAMES):
+ * pos: the player ped's position, heading (degrees) and the clock, read with the title's natives;
+ * tp <x> <y> <z> [<heading>]: the title's own setter (the area streams in, the ped is held
+   meanwhile), then the read-back;
+ * tpsave <name> / tpgo <name> / tpmarks: bookmarks in VICTORY_DEBUG_BOOKMARKS (default
+   bookmarks.txt in the channel's folder), one line `name x y z heading pitch hh:mm` (the
+   channel's older format; tpgo also sets the clock);
+ * time [<hh> <mm> [<ss>]] and date [<day> <month> <year>] (months 1-12; the title counts from 0);
+   without arguments they only read.
+Trace: the by-ID call path (+0x3de2331 in +0x3de2250: methods of the script-visible classes) goes
+through the same dispatch (21 bytes, checked, logged); VICTORY_NATIVES_LOG_PER=<n> keeps only each
+native's first n calls in the full log; VICTORY_NATIVES_WATCHMEM watches memory from the start.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Kit-Source: own (inkVI-dive)
+Kit-Licence: GPL-3.0
+---
+ crates/victory-loader/src/natives.rs | 420 +++++++++++++++++++++++++--
+ 1 file changed, 390 insertions(+), 30 deletions(-)
+
+diff --git a/crates/victory-loader/src/natives.rs b/crates/victory-loader/src/natives.rs
+index 58107bfb9..c1ef34992 100644
+--- a/crates/victory-loader/src/natives.rs
++++ b/crates/victory-loader/src/natives.rs
+@@ -36,6 +36,12 @@ const BUILD_1_0_2_1: &str = "b99f876b74d4a77f";
+ /// The NATIVE opcode's call: `lea rcx, [rsp+0A8h] ; vzeroupper ; call r15`.
+ const SITE: usize = 0x3de_7503;
+ const SITE_BYTES: [u8; 14] = [0x48, 0x8d, 0x8c, 0x24, 0xa8, 0, 0, 0, 0xc5, 0xf8, 0x77, 0x41, 0xff, 0xd7];
++/// The by-ID call (+0x3de2250: methods of the script-visible classes, and natives called by ID):
++/// `lea rcx, [rsp+28h] ; lea r14, [rbx+1470h] ; lea rdi, [rbx+1270h] ; call [rax]`.
++const SITE2: usize = 0x3de_2331;
++const SITE2_BYTES: [u8; 21] = [0x48, 0x8d, 0x4c, 0x24, 0x28, 0x4c, 0x8d, 0xb3, 0x70, 0x14, 0, 0, 0x48, 0x8d, 0xbb, 0x70, 0x12, 0, 0, 0xff, 0x10];
++/// Optional: the full log (`VICTORY_NATIVES=log`) keeps only each native's first `<n>` calls (0 or unset = all).
++pub const LOG_PER_ENV: &str = "VICTORY_NATIVES_LOG_PER";
+ /// How many handlers this build has (a different count is only warned about).
+ const HANDLERS_1_0_2_1: usize = 6820;
+ /// Samples (first calls with their arguments) kept per native.
+@@ -67,6 +73,107 @@ struct Call {
+     nret: usize,
+     store: Option<String>,
+     text: String,
++    after: Option<After>,
++}
++
++/// What a shorthand command (`pos`, `tp`, `time`, `date`, `tpsave`, `tpgo`) reports once its last call has run.
++#[derive(Clone, Debug, PartialEq)]
++pub enum After {
++    /// One line: position, heading (degrees), clock.
++    Pos,
++    /// The clock.
++    Time,
++    /// The calendar date.
++    Date,
++    /// The position line, also written to the bookmarks file under `name`.
++    Save { name: String, file: std::path::PathBuf },
++}
++
++/// One teleport bookmark: a line `name x y z heading pitch [hh:mm]` (the debug channel's bookmarks file).
++#[derive(Clone, Debug, PartialEq)]
++pub struct Mark {
++    pub name: String,
++    pub pos: [f32; 3],
++    pub heading: f32,
++    pub time: Option<(u32, u32)>,
++}
++
++impl Mark {
++    pub fn parse(line: &str) -> Option<Mark> {
++        let mut f = line.split_whitespace();
++        let name = f.next()?.to_string();
++        if name.starts_with('#') {
++            return None;
++        }
++        let mut num = || f.next()?.parse::<f32>().ok();
++        let pos = [num()?, num()?, num()?];
++        let heading = num().unwrap_or(0.0);
++        let _pitch = num();
++        let time = f.next().and_then(|t| {
++            let (h, m) = t.split_once(':')?;
++            Some((h.parse().ok()?, m.parse().ok()?))
++        });
++        Some(Mark { name, pos, heading, time })
++    }
++
++    pub fn line(&self) -> String {
++        let mut s = format!("{} {:.3} {:.3} {:.3} {:.2} 0.00", self.name, self.pos[0], self.pos[1], self.pos[2], self.heading);
++        if let Some((h, m)) = self.time {
++            s.push_str(&format!(" {h:02}:{m:02}"));
++        }
++        s
++    }
++}
++
++/// The bookmarks file: `VICTORY_DEBUG_BOOKMARKS`, else `bookmarks.txt` in the channel's folder.
++fn marks_file(folder: &std::path::Path) -> std::path::PathBuf {
++    std::env::var_os("VICTORY_DEBUG_BOOKMARKS").map_or_else(|| folder.join("bookmarks.txt"), std::path::PathBuf::from)
++}
++
++/// The file's text with `mark` in place of a bookmark of the same name (other lines, comments too, are kept).
++pub fn with_mark(text: &str, mark: &Mark) -> String {
++    let mut out: String = text.lines().filter(|l| Mark::parse(l).is_none_or(|m| m.name != mark.name)).map(|l| format!("{l}\n")).collect();
++    out.push_str(&mark.line());
++    out.push('\n');
++    out
++}
++
++/// The line a finished shorthand command reports, from the variables its calls stored
++/// (`_pos`, `_hdg`, `_h`, `_m`, `_s`); `Save` also writes the bookmark.
++fn finish(vars: &HashMap<String, Vec<u64>>, after: &After) -> String {
++    let f = |v: u64| f32::from_bits(v as u32);
++    let pos = vars.get("_pos").filter(|v| v.len() >= 2).map(|v| [f(v[0]), f(v[0] >> 32), f(v[1])]);
++    // The title's heading natives work in radians (0 to 2 pi); the commands and the bookmarks in degrees.
++    let heading = vars.get("_hdg").and_then(|v| v.first()).map(|v| f(*v).to_degrees());
++    let int = |name: &str| vars.get(name).and_then(|v| v.first()).map(|v| *v as u32);
++    let clock = match (int("_h"), int("_m")) {
++        (Some(h), Some(m)) => Some((h, m, int("_s").unwrap_or(0))),
++        _ => None,
++    };
++    let time = clock.map_or("time ?".to_string(), |(h, m, s)| format!("time {h:02}:{m:02}:{s:02}"));
++    if *after == After::Time {
++        return time;
++    }
++    if *after == After::Date {
++        // The title counts months from 0 (as its date setter does); the command and the reply from 1.
++        return match (int("_dd"), int("_dm"), int("_dy")) {
++            (Some(d), Some(m), Some(y)) => format!("date {d} {} {y}", m + 1),
++            _ => "date ?".to_string(),
++        };
++    }
++    let Some(p) = pos else { return "pos ? (no position came back)".to_string() };
++    let line = format!("pos {:.3} {:.3} {:.3} heading {} {time}", p[0], p[1], p[2], heading.map_or("?".to_string(), |h| format!("{h:.2}")));
++    match after {
++        After::Save { name, file } => {
++            let mark = Mark { name: name.clone(), pos: p, heading: heading.unwrap_or(0.0), time: clock.map(|(h, m, _)| (h, m)) };
++            let text = with_mark(&std::fs::read_to_string(file).unwrap_or_default(), &mark);
++            match std::fs::write(file, text) {
++                Ok(()) => format!("saved `{}` in {}: {line}", mark.line(), file.display()),
++                Err(e) => format!("error: {}: {e} ({line})", file.display()),
++            }
++        }
++        _ => line,
++    }
+ }
+ 
+ #[derive(Clone, Default)]
+@@ -88,6 +195,19 @@ struct Stat {
+     samples: Vec<Sample>,
+ }
+ 
++/// One call in the full log.
++struct Logged {
++    seq: u64,
++    ms: u32,
++    rva: u32,
++    script: u32,
++    argc: u32,
++    /// Called through the by-ID path (a class method or a native by ID), not the NATIVE opcode.
++    by_id: bool,
++    args: [u64; 4],
++    ret: u64,
++}
++
+ #[derive(Default)]
+ struct Trace {
+     stats: HashMap<usize, Stat>,
+@@ -102,8 +222,8 @@ struct Trace {
+     mem_events: Vec<String>,
+     /// Events noted per first changed offset (a counter that changes every frame is noted only a few times).
+     mem_seen: HashMap<usize, u32>,
+-    /// Every call (`VICTORY_NATIVES=log`): call number, rva, script, argc, the first four args, the first return slot.
+-    log: Vec<(u64, u32, u32, u32, [u64; 4], u64)>,
++    /// Every call (`VICTORY_NATIVES=log`).
++    log: Vec<Logged>,
+ }
+ 
+ #[derive(Default)]
+@@ -141,8 +261,10 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
+ static IN_QUEUE: AtomicBool = AtomicBool::new(false);
+ static MEMWATCH: AtomicBool = AtomicBool::new(false);
+ static LOGGING: AtomicBool = AtomicBool::new(false);
++/// The full log keeps only each native's first calls (`VICTORY_NATIVES_LOG_PER`; 0 = all).
++static LOG_PER: AtomicU64 = AtomicU64::new(0);
+ /// Calls the full log keeps (the first ones).
+-const LOG_MAX: usize = 3_000_000;
++const LOG_MAX: usize = 4_000_000;
+ /// Changes of watched memory that are kept.
+ const MEM_EVENTS_MAX: usize = 3000;
+ 
+@@ -214,13 +336,32 @@ pub fn joaat(text: &str) -> u32 {
+ /// The stub the patched site calls: `lea rcx, [rsp+0B0h]` (the context: the
+ /// title's `[rsp+0A8h]` seen past our return address) ; `mov rdx, r15` (the
+ /// handler) ; `mov r8, rbp` (the script context) ; `vzeroupper` ;
+-/// `jmp [rip+0]` ; the address of [`dispatch`].
++/// `xor r9d, r9d` (not the by-ID path) ; `jmp [rip+0]` ; the address of [`dispatch`].
+ fn stub_code(dispatch: usize) -> Vec<u8> {
+-    let mut c = vec![0x48, 0x8d, 0x8c, 0x24, 0xb0, 0, 0, 0, 0x4c, 0x89, 0xfa, 0x49, 0x89, 0xe8, 0xc5, 0xf8, 0x77, 0xff, 0x25, 0, 0, 0, 0];
++    let mut c = vec![0x48, 0x8d, 0x8c, 0x24, 0xb0, 0, 0, 0, 0x4c, 0x89, 0xfa, 0x49, 0x89, 0xe8, 0xc5, 0xf8, 0x77, 0x45, 0x31, 0xc9, 0xff, 0x25, 0, 0, 0, 0];
+     c.extend(dispatch.to_le_bytes());
+     c
+ }
+ 
++/// The stub for the by-ID call: `lea rcx, [rsp+30h]` (the context: the title's `[rsp+28h]` past our return
++/// address) ; the title's two `lea`s ; `mov rdx, [rax]` (the handler) ; `mov r8, rsi` (the script context) ;
++/// `mov r9d, 1` ; `vzeroupper` ; `jmp [rip+0]` ; the address of [`dispatch`].
++fn stub2_code(dispatch: usize) -> Vec<u8> {
++    let mut c = vec![0x48, 0x8d, 0x4c, 0x24, 0x30];
++    c.extend(&SITE2_BYTES[5..19]);
++    c.extend([0x48, 0x8b, 0x10, 0x49, 0x89, 0xf0, 0x41, 0xb9, 1, 0, 0, 0, 0xc5, 0xf8, 0x77, 0xff, 0x25, 0, 0, 0, 0]);
++    c.extend(dispatch.to_le_bytes());
++    c
++}
++
++/// The bytes for the by-ID site: `call stub` and sixteen bytes of NOPs.
++fn site2_code(site: usize, stub: usize) -> Option<[u8; 21]> {
++    let rel = i32::try_from(stub as i64 - (site as i64 + 5)).ok()?;
++    let mut c = [0xe8, 0, 0, 0, 0, 0x66, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0, 0x0f, 0x1f, 0x80, 0, 0, 0, 0];
++    c[1..5].copy_from_slice(&rel.to_le_bytes());
++    Some(c)
++}
++
+ /// The bytes for the site: `call stub` and a nine-byte NOP.
+ fn site_code(site: usize, stub: usize) -> Option<[u8; 14]> {
+     let rel = i32::try_from(stub as i64 - (site as i64 + 5)).ok()?;
+@@ -258,6 +399,7 @@ pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
+         return;
+     }
+     let stub = stub_code(dispatch as *const () as usize);
++    let stub2 = stub2_code(dispatch as *const () as usize);
+     let Some(place) = near_image(base, size, 0x1000) else {
+         tracing::warn!("{ENV}: no memory near the image for the stub; no natives hook");
+         return;
+@@ -269,6 +411,7 @@ pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
+     // SAFETY: `place` is a fresh page of ours; the site's bytes were checked.
+     unsafe {
+         std::ptr::copy_nonoverlapping(stub.as_ptr(), place as *mut u8, stub.len());
++        std::ptr::copy_nonoverlapping(stub2.as_ptr(), (place + 0x40) as *mut u8, stub2.len());
+         let mut old = 0;
+         VirtualProtect(place as _, 0x1000, PAGE_EXECUTE_READ, &mut old);
+     }
+@@ -289,6 +432,7 @@ pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
+     }
+     TRACING.store(mode == "trace" || mode == "log", Ordering::Relaxed);
+     LOGGING.store(mode == "log", Ordering::Relaxed);
++    LOG_PER.store(std::env::var(LOG_PER_ENV).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0), Ordering::Relaxed);
+     if let Ok(spec) = std::env::var(WATCHMEM_ENV) {
+         match set_memwatch(&spec) {
+             Ok(text) => tracing::info!("{WATCHMEM_ENV}: {text}"),
+@@ -310,6 +454,17 @@ pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
+         trace = mode == "trace",
+         "{ENV}: natives hook applied (the NATIVE opcode's call goes through the layer; `ncall` runs natives on the script thread)"
+     );
++    // The by-ID call path (class methods): traced too, when its bytes are the expected ones.
++    // SAFETY: inside the mapped .text of this exact build.
++    let now2 = unsafe { std::slice::from_raw_parts((base + SITE2) as *const u8, SITE2_BYTES.len()) };
++    match site2_code(base + SITE2, place + 0x40) {
++        Some(new2) if now2 == SITE2_BYTES => {
++            // SAFETY: the bytes are the ones checked; no title code runs yet.
++            let ok = unsafe { crate::hooks::write((base + SITE2) as *mut u8, &new2) };
++            tracing::info!(site = format_args!("{SITE2:#x}"), old = ?SITE2_BYTES, new = ?new2, ok, "{ENV}: by-ID call hook (class methods are traced too)");
++        }
++        _ => tracing::warn!(rva = format_args!("{SITE2:#x}"), "{ENV}: the by-ID call is not the expected bytes; class methods are not traced"),
++    }
+ }
+ 
+ #[cfg(windows)]
+@@ -401,7 +556,7 @@ unsafe fn script_id(sctx: usize) -> u32 {
+ /// # Safety
+ /// Called only by the stub, on a title thread inside the interpreter.
+ #[cfg(windows)]
+-unsafe extern "win64" fn dispatch(ctx: *mut Ctx, handler: usize, sctx: usize) {
++unsafe extern "win64" fn dispatch(ctx: *mut Ctx, handler: usize, sctx: usize, by_id: usize) {
+     let Some(st) = STATE.get() else {
+         // SAFETY: the call the title asked for.
+         unsafe { std::mem::transmute::<usize, unsafe extern "win64" fn(*mut Ctx)>(handler)(ctx) };
+@@ -420,7 +575,7 @@ unsafe extern "win64" fn dispatch(ctx: *mut Ctx, handler: usize, sctx: usize) {
+     let mut sampled = None;
+     if TRACING.load(Ordering::Relaxed) {
+         // SAFETY: the context the interpreter just built.
+-        sampled = unsafe { before(st, &*ctx, handler, sctx) };
++        sampled = unsafe { before(st, &*ctx, handler, sctx, by_id == 1) };
+     }
+     // SAFETY: the call the title asked for.
+     unsafe { std::mem::transmute::<usize, unsafe extern "win64" fn(*mut Ctx)>(handler)(ctx) };
+@@ -437,8 +592,8 @@ unsafe extern "win64" fn dispatch(ctx: *mut Ctx, handler: usize, sctx: usize) {
+         let mut t = lock(&st.trace);
+         if LOGGING.load(Ordering::Relaxed) {
+             // The entry is near the end (other threads may have added a few since).
+-            if let Some(e) = t.log.iter_mut().rev().take(64).find(|e| e.0 == seq) {
+-                e.5 = ret.first().copied().unwrap_or(0);
++            if let Some(e) = t.log.iter_mut().rev().take(64).find(|e| e.seq == seq) {
++                e.ret = ret.first().copied().unwrap_or(0);
+             }
+         }
+         if watched {
+@@ -535,7 +690,7 @@ fn parse_ranges(spec: &str, base: usize, size: usize) -> Result<Vec<(usize, usiz
+ /// Counts the call; for a native's first calls (and for watched natives)
+ /// keeps the arguments. Returns the sample's sequence number if one was kept.
+ #[cfg(windows)]
+-unsafe fn before(st: &State, ctx: &Ctx, handler: usize, sctx: usize) -> Option<(u64, bool)> {
++unsafe fn before(st: &State, ctx: &Ctx, handler: usize, sctx: usize, by_id: bool) -> Option<(u64, bool)> {
+     let seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+     let rva = handler.wrapping_sub(st.base);
+     // SAFETY: the interpreter's context.
+@@ -553,7 +708,9 @@ unsafe fn before(st: &State, ctx: &Ctx, handler: usize, sctx: usize) -> Option<(
+         stat.retc = ctx.retc;
+     }
+     let keep = stat.samples.len() < SAMPLES;
+-    let logging = LOGGING.load(Ordering::Relaxed) && t.log.len() < LOG_MAX;
++    let count = stat.count;
++    let per = LOG_PER.load(Ordering::Relaxed);
++    let logging = LOGGING.load(Ordering::Relaxed) && t.log.len() < LOG_MAX && (per == 0 || count <= per);
+     if logging {
+         let mut a = [0u64; 4];
+         if !ctx.args.is_null() {
+@@ -562,7 +719,8 @@ unsafe fn before(st: &State, ctx: &Ctx, handler: usize, sctx: usize) -> Option<(
+                 a[i] = unsafe { ctx.args.add(i).read_unaligned() };
+             }
+         }
+-        t.log.push((seq, rva as u32, script, ctx.argc, a, 0));
++        let ms = st.started.elapsed().as_millis() as u32;
++        t.log.push(Logged { seq, ms, rva: rva as u32, script, argc: ctx.argc, by_id, args: a, ret: 0 });
+     }
+     if !keep && !watched {
+         return if logging { Some((seq, false)) } else { None };
+@@ -633,6 +791,9 @@ unsafe fn run_queue(st: &State, sctx: usize) {
+         if let Some(name) = call.store {
+             q.vars.insert(name, ret[..call.nret.clamp(1, 16)].to_vec());
+         }
++        if let Some(after) = &call.after {
++            text = format!("{text}\n{}", finish(&q.vars, after));
++        }
+         q.done.insert(call.id, text);
+     }
+ }
+@@ -731,13 +892,28 @@ pub enum Reply {
+ pub fn command(line: &str, folder: &std::path::Path) -> Reply {
+     let words: Vec<&str> = line.split_whitespace().collect();
+     let Some(&cmd) = words.first() else { return Reply::NotOurs };
+-    if !matches!(cmd, "ncall" | "nstat" | "ntrace" | "ndump" | "nmark" | "nwatch" | "nscript" | "nfind" | "nhelp" | "npos" | "ntp" | "ntime" | "nwatchmem" | "nlog") {
++    if !matches!(
++        cmd,
++        "ncall" | "nstat" | "ntrace" | "ndump" | "nmark" | "nwatch" | "nscript" | "nfind" | "nhelp" | "npos" | "ntp" | "ntime" | "nwatchmem" | "nlog"
++            | "pos" | "tp" | "time" | "date" | "tpsave" | "tpgo" | "tpmarks"
++    ) {
++        return Reply::NotOurs;
++    }
++    if cmd == "tpmarks" {
++        let file = marks_file(folder);
++        let marks: Vec<String> = std::fs::read_to_string(&file).unwrap_or_default().lines().filter_map(Mark::parse).map(|m| m.line()).collect();
++        return Reply::Now(Ok(if marks.is_empty() { format!("no bookmarks in {}", file.display()) } else { marks.join("\n") }));
++    }
++    // Without the hook, `pos`, `tp` and `time` are the channel's own (direct memory) commands.
++    if STATE.get().is_none() && matches!(cmd, "pos" | "tp" | "time") {
+         return Reply::NotOurs;
+     }
+     if cmd == "nhelp" {
+         return Reply::Now(Ok("ncall <NAME|0xhash|+0xrva> [ret=<n>] [><var>] [<arg>...] (args: 12, 0x1f, 1.5, s:TEXT, h:TEXT, $var, $var.<i>, buf:<n>; ~ = space) | \
+             nstat | ntrace on|off | ndump | nmark <label> | nwatch <native>|off | nscript <id>|any | nfind <native> | \
+-            nwatchmem +0x<rva>:<len>[,...]|off | nlog [<from call> [<to call>]] (needs VICTORY_NATIVES=log) | npos | ntp <x> <y> <z> | ntime <hh> <mm>"
++            nwatchmem +0x<rva>:<len>[,...]|off | nlog [<from call> [<to call>]] (needs VICTORY_NATIVES=log) | npos | ntp <x> <y> <z> | ntime <hh> <mm> | \
++            through the title's own natives: pos | tp <x> <y> <z> [<heading>] | time [<hh> <mm> [<ss>]] | date [<day> <month> <year>] | \
++            tpsave <name> | tpgo <name> | tpmarks"
+             .into()));
+     }
+     let Some(st) = STATE.get() else {
+@@ -745,10 +921,31 @@ pub fn command(line: &str, folder: &std::path::Path) -> Reply {
+     };
+     let args = &words[1..];
+     match cmd {
+-        "ncall" => match queue_call(st, args) {
++        "ncall" => match queue_call(st, args, None) {
+             Ok((id, text)) => Reply::Queued(vec![id], text),
+             Err(e) => Reply::Now(Err(e)),
+         },
++        // Position, teleport, clock and bookmarks through the title's own natives (names file).
++        "pos" | "tp" | "time" | "date" | "tpsave" | "tpgo" => {
++            let known = |name: &str| st.names.get(name).is_some_and(|h| st.by_hash.contains_key(h));
++            let plan = match shorthand(cmd, args, &marks_file(folder), &known) {
++                Ok(plan) => plan,
++                Err(e) => return Reply::Now(Err(e)),
++            };
++            let (mut ids, mut texts) = (Vec::new(), Vec::new());
++            let last = plan.0.len().saturating_sub(1);
++            for (i, l) in plan.0.iter().enumerate() {
++                let words: Vec<&str> = l.split_whitespace().collect();
++                match queue_call(st, &words, if i == last { Some(plan.1.clone()) } else { None }) {
++                    Ok((id, text)) => {
++                        ids.push(id);
++                        texts.push(text);
++                    }
++                    Err(e) => return Reply::Now(Err(e)),
++                }
++            }
++            Reply::Queued(ids, texts.join("\n"))
++        }
+         // Shorthands over the natives named in the names file (tools/natives-names.txt of the inkVI-dive kit).
+         "npos" | "ntp" | "ntime" => {
+             let lines: Vec<String> = match (cmd, args) {
+@@ -765,7 +962,7 @@ pub fn command(line: &str, folder: &std::path::Path) -> Reply {
+             let (mut ids, mut texts) = (Vec::new(), Vec::new());
+             for l in &lines {
+                 let words: Vec<&str> = l.split_whitespace().collect();
+-                match queue_call(st, &words) {
++                match queue_call(st, &words, None) {
+                     Ok((id, text)) => {
+                         ids.push(id);
+                         texts.push(text);
+@@ -779,19 +976,24 @@ pub fn command(line: &str, folder: &std::path::Path) -> Reply {
+             let num = |i: usize, d: u64| args.get(i).and_then(|w| w.parse::<u64>().ok()).unwrap_or(d);
+             let (from, to) = (num(0, 0), num(1, u64::MAX));
+             let t = lock(&st.trace);
+-            let mut out = String::from("# call\trva\thash\tscript\targc\targs (first four)\tfirst return slot\n");
++            let mut out = String::from("# call\trva\thash (`by-id` = a class method)\tscript\targc\targs (first four)\tfirst return slot\tms\n");
+             let mut n = 0;
+-            for e in t.log.iter().filter(|e| e.0 >= from && e.0 <= to).take(400_000) {
+-                let argc = (e.3 as usize).min(4);
++            for e in t.log.iter().filter(|e| e.seq >= from && e.seq <= to).take(2_000_000) {
++                let argc = (e.argc as usize).min(4);
++                let hash = match st.by_rva.get(&(e.rva as usize)) {
++                    Some(h) => format!("{h:#018x}"),
++                    None if e.by_id => "by-id".to_string(),
++                    None => "0x0000000000000000".to_string(),
++                };
+                 out.push_str(&format!(
+-                    "{}\t+{:#x}\t{:#018x}\t{:#x}\t{}\t({})\t{}\n",
+-                    e.0,
+-                    e.1,
+-                    st.by_rva.get(&(e.1 as usize)).copied().unwrap_or(0),
+-                    e.2,
+-                    e.3,
+-                    e.4[..argc].iter().map(|a| fmt_slot(*a)).collect::<Vec<_>>().join(" "),
+-                    fmt_slot(e.5)
++                    "{}\t+{:#x}\t{hash}\t{:#x}\t{}\t({})\t{}\t{}\n",
++                    e.seq,
++                    e.rva,
++                    e.script,
++                    e.argc,
++                    e.args[..argc].iter().map(|a| fmt_slot(*a)).collect::<Vec<_>>().join(" "),
++                    fmt_slot(e.ret),
++                    e.ms
+                 ));
+                 n += 1;
+             }
+@@ -865,8 +1067,92 @@ pub fn command(line: &str, folder: &std::path::Path) -> Reply {
+     }
+ }
+ 
++/// The `ncall` lines of a shorthand command (`pos`, `tp`, `time`, `date`, `tpsave`, `tpgo`) and what to report at the
++/// end. `known` says whether a native's name is in the names file: headings are left out when
++/// `GET_ENTITY_HEADING` / `SET_ENTITY_HEADING` are not.
++pub fn shorthand(cmd: &str, args: &[&str], marks: &std::path::Path, known: &dyn Fn(&str) -> bool) -> Result<(Vec<String>, After), String> {
++    let num = |i: usize, what: &str| args.get(i).and_then(|w| w.parse::<f32>().ok()).filter(|v| v.is_finite()).ok_or_else(|| format!("bad or missing {what}"));
++    let read = || {
++        let mut v = vec!["PLAYER_PED_ID ret=2 >_ped".to_string(), "GET_ENTITY_COORDS ret=2 >_pos $_ped 0".to_string()];
++        if known("GET_ENTITY_HEADING") {
++            v.push("GET_ENTITY_HEADING >_hdg $_ped".to_string());
++        }
++        v.extend(["GET_CLOCK_HOURS >_h", "GET_CLOCK_MINUTES >_m", "GET_CLOCK_SECONDS >_s"].map(String::from));
++        v
++    };
++    let go = |pos: [f32; 3], heading: Option<f32>| {
++        // As the title's own scripts call it: 0.0, no flags, 1, -1.0 (the area streams in, the ped is held meanwhile).
++        let mut v = vec!["PLAYER_PED_ID ret=2 >_ped".to_string(), format!("SET_ENTITY_COORDS $_ped v:{},{},{} 0.0 0 1 -1.0", pos[0], pos[1], pos[2])];
++        if let Some(h) = heading.filter(|_| known("SET_ENTITY_HEADING")) {
++            v.push(format!("SET_ENTITY_HEADING $_ped {:.5}", h.rem_euclid(360.0).to_radians()));
++        }
++        v
++    };
++    let clock = |h: u32, m: u32, s: u32| {
++        if h < 24 && m < 60 && s < 60 { Ok(format!("SET_CLOCK_TIME {h} {m} {s}")) } else { Err(format!("no such time {h}:{m}:{s}")) }
++    };
++    match cmd {
++        "pos" => Ok((read(), After::Pos)),
++        "tpsave" => {
++            let name = args.first().filter(|n| !n.starts_with('#')).ok_or("tpsave <name>")?;
++            Ok((read(), After::Save { name: name.to_string(), file: marks.to_path_buf() }))
++        }
++        "tp" => {
++            let pos = [num(0, "x")?, num(1, "y")?, num(2, "z")?];
++            let heading = if args.len() > 3 { Some(num(3, "heading")?) } else { None };
++            let mut v = go(pos, heading);
++            v.extend(read());
++            Ok((v, After::Pos))
++        }
++        "time" => {
++            let int = |i: usize| args.get(i).map_or(Ok(0), |w| w.parse::<u32>().map_err(|_| format!("bad number {w}")));
++            let mut v: Vec<String> = Vec::new();
++            match args.len() {
++                // No arguments: only read the clock.
++                0 => {}
++                2 | 3 => v.push(clock(int(0)?, int(1)?, int(2)?)?),
++                _ => return Err("time [<hh> <mm> [<ss>]]".into()),
++            }
++            v.extend(["GET_CLOCK_HOURS >_h", "GET_CLOCK_MINUTES >_m", "GET_CLOCK_SECONDS >_s"].map(String::from));
++            Ok((v, After::Time))
++        }
++        "date" => {
++            let mut v: Vec<String> = Vec::new();
++            match args {
++                // No arguments: only read the date.
++                [] => {}
++                [d, m, y] => {
++                    let int = |w: &str| w.parse::<u32>().map_err(|_| format!("bad number {w}"));
++                    let (d, m, y) = (int(d)?, int(m)?, int(y)?);
++                    // The title's own check (+0x51acd90): day 1.., month 0..=11, year 1970..=2499, and the day
++                    // must exist in that month (it leaves the date as it is otherwise: the reply shows it).
++                    if !(1..=31).contains(&d) || !(1..=12).contains(&m) || !(1970..=2499).contains(&y) {
++                        return Err(format!("no such date {d} {m} {y} (day, month 1-12, year 1970-2499)"));
++                    }
++                    v.push(format!("SET_CLOCK_DATE {d} {} {y}", m - 1));
++                }
++                _ => return Err("date [<day> <month 1-12> <year>]".into()),
++            }
++            v.extend(["GET_CLOCK_DAY_OF_MONTH >_dd", "GET_CLOCK_MONTH >_dm", "GET_CLOCK_YEAR >_dy"].map(String::from));
++            Ok((v, After::Date))
++        }
++        "tpgo" => {
++            let name = args.first().ok_or("tpgo <name>")?;
++            let text = std::fs::read_to_string(marks).map_err(|e| format!("{}: {e}", marks.display()))?;
++            let mark = text.lines().filter_map(Mark::parse).find(|m| m.name == *name).ok_or_else(|| format!("no bookmark {name} in {}", marks.display()))?;
++            let mut v = go(mark.pos, Some(mark.heading));
++            if let Some((h, m)) = mark.time {
++                v.push(clock(h, m, 0)?);
++            }
++            v.extend(read());
++            Ok((v, After::Pos))
++        }
++        _ => Err(format!("{cmd}: not a shorthand")),
++    }
++}
++
+ /// Queues one call: `<native> [ret=<n>] [><var>] [<arg>...]`.
+-fn queue_call(st: &State, args: &[&str]) -> Result<(u64, String), String> {
++fn queue_call(st: &State, args: &[&str], after: Option<After>) -> Result<(u64, String), String> {
+     let name = args.first().ok_or("ncall <native> [ret=<n>] [><var>] [<arg>...]")?;
+     let rva = target(st, name)?;
+     let (mut nret, mut store, mut parsed) = (1usize, None, Vec::new());
+@@ -883,7 +1169,7 @@ fn queue_call(st: &State, args: &[&str]) -> Result<(u64, String), String> {
+     let id = q.next_id;
+     q.next_id += 1;
+     let text = format!("{name} (+{rva:#x}, hash {:#018x}) {}", st.by_rva[&rva], args[1..].join(" "));
+-    q.calls.push_back(Call { id, rva, args: parsed, nret, store, text: text.clone() });
++    q.calls.push_back(Call { id, rva, args: parsed, nret, store, text: text.clone(), after });
+     QUEUED.store(q.calls.len(), Ordering::Relaxed);
+     Ok((id, format!("queued #{id}: {text}")))
+ }
+@@ -976,7 +1262,17 @@ mod tests {
+         // lea rcx, [rsp+0B0h]: the title's [rsp+0A8h] past the return address our call pushed.
+         assert_eq!(stub[..8], [0x48, 0x8d, 0x8c, 0x24, 0xb0, 0, 0, 0]);
+         assert_eq!(stub[stub.len() - 8..], 0x1122_3344_5566_7788u64.to_le_bytes());
+-        assert_eq!(stub.len(), 31);
++        assert_eq!(stub.len(), 34);
++        // The by-ID stub keeps the title's two `lea`s and ends in the same jump.
++        let stub2 = stub2_code(0x1122_3344_5566_7788);
++        assert_eq!(stub2[..5], [0x48, 0x8d, 0x4c, 0x24, 0x30]);
++        assert_eq!(stub2[5..19], SITE2_BYTES[5..19]);
++        assert_eq!(stub2[stub2.len() - 8..], 0x1122_3344_5566_7788u64.to_le_bytes());
++        assert!(stub2.len() <= 0x40);
++        let site2 = site2_code(0x1_43de_2331, 0x1_4b10_0040).unwrap();
++        assert_eq!(site2.len(), SITE2_BYTES.len());
++        let rel2 = i32::from_le_bytes(site2[1..5].try_into().unwrap());
++        assert_eq!(0x1_43de_2331i64 + 5 + i64::from(rel2), 0x1_4b10_0040);
+         let site = site_code(0x1_43de_7503, 0x1_4b10_0000).unwrap();
+         assert_eq!(site.len(), SITE_BYTES.len());
+         assert_eq!(site[0], 0xe8);
+@@ -1007,4 +1303,68 @@ mod tests {
+         assert_eq!(fmt_slot(u64::from(2.5f32.to_bits())), "0x40200000(2.5)");
+         assert_eq!(fmt_slot(7), "0x7");
+     }
++
++    #[test]
++    fn shorthands_and_bookmarks() {
++        let none = std::path::Path::new("/nonexistent/bookmarks.txt");
++        let all = |_: &str| true;
++        let no_heading = |n: &str| !n.contains("HEADING");
++        let (calls, after) = shorthand("tp", &["-1293.05", "399.83", "2.9", "90"], none, &all).unwrap();
++        assert_eq!(calls[1], "SET_ENTITY_COORDS $_ped v:-1293.05,399.83,2.9 0.0 0 1 -1.0");
++        assert_eq!(calls[2], "SET_ENTITY_HEADING $_ped 1.57080");
++        assert_eq!(calls.last().unwrap(), "GET_CLOCK_SECONDS >_s");
++        assert_eq!(after, After::Pos);
++        // Without the heading natives the teleport and the read-back leave the heading out.
++        let (calls, _) = shorthand("tp", &["1", "2", "3", "90"], none, &no_heading).unwrap();
++        assert!(calls.iter().all(|c| !c.contains("HEADING")));
++        assert!(shorthand("tp", &["1", "2"], none, &all).is_err());
++        assert!(shorthand("tp", &["1", "2", "x"], none, &all).is_err());
++        assert_eq!(shorthand("time", &["7", "30"], none, &all).unwrap().0[0], "SET_CLOCK_TIME 7 30 0");
++        assert_eq!(shorthand("time", &["7", "30", "15"], none, &all).unwrap().0[0], "SET_CLOCK_TIME 7 30 15");
++        assert!(shorthand("time", &["24", "0"], none, &all).is_err());
++        assert!(shorthand("time", &["7"], none, &all).is_err());
++        // `time` and `date` alone only read.
++        assert_eq!(shorthand("time", &[], none, &all).unwrap().0[0], "GET_CLOCK_HOURS >_h");
++        assert_eq!(shorthand("date", &[], none, &all).unwrap().0[0], "GET_CLOCK_DAY_OF_MONTH >_dd");
++        // The title's months count from 0.
++        let (calls, after) = shorthand("date", &["21", "7", "2019"], none, &all).unwrap();
++        assert_eq!(calls[0], "SET_CLOCK_DATE 21 6 2019");
++        assert_eq!(after, After::Date);
++        assert!(shorthand("date", &["0", "7", "2019"], none, &all).is_err());
++        assert!(shorthand("date", &["1", "13", "2019"], none, &all).is_err());
++        assert!(shorthand("date", &["1", "1", "1969"], none, &all).is_err());
++        assert!(shorthand("date", &["1", "1"], none, &all).is_err());
++        assert!(shorthand("tpgo", &["pier"], none, &all).is_err());
++        // Every line the shorthands make parses as a call's arguments.
++        for c in shorthand("tp", &["1", "2", "3", "90"], none, &all).unwrap().0 {
++            for w in c.split_whitespace().skip(1).filter(|w| !w.starts_with("ret=") && !w.starts_with('>')) {
++                assert!(parse_args(w).is_ok(), "{w}");
++            }
++        }
++
++        let mark = Mark::parse("pier -1293.050 399.830 2.900 90.00 0.00 07:30").unwrap();
++        assert_eq!(mark, Mark { name: "pier".into(), pos: [-1293.05, 399.83, 2.9], heading: 90.0, time: Some((7, 30)) });
++        assert_eq!(mark.line(), "pier -1293.050 399.830 2.900 90.00 0.00 07:30");
++        assert_eq!(Mark::parse("# a comment"), None);
++        assert_eq!(Mark::parse("cell 1 2 3").unwrap().heading, 0.0);
++        // A saved bookmark replaces the one of the same name and keeps the rest.
++        let text = with_mark("# spots\ncell 1 2 3 0 0\npier 0 0 0 0 0\n", &mark);
++        assert_eq!(text, "# spots\ncell 1 2 3 0 0\npier -1293.050 399.830 2.900 90.00 0.00 07:30\n");
++
++        let mut vars = HashMap::new();
++        vars.insert("_pos".to_string(), vec_slots(-1293.05, 399.83, 2.9).to_vec());
++        vars.insert("_h".to_string(), vec![7]);
++        vars.insert("_m".to_string(), vec![30]);
++        assert_eq!(finish(&vars, &After::Pos), "pos -1293.050 399.830 2.900 heading ? time 07:30:00");
++        vars.insert("_hdg".to_string(), vec![u64::from(std::f32::consts::FRAC_PI_2.to_bits())]);
++        vars.insert("_s".to_string(), vec![5]);
++        assert_eq!(finish(&vars, &After::Pos), "pos -1293.050 399.830 2.900 heading 90.00 time 07:30:05");
++        assert_eq!(finish(&vars, &After::Time), "time 07:30:05");
++        assert_eq!(finish(&vars, &After::Date), "date ?");
++        vars.insert("_dd".to_string(), vec![21]);
++        vars.insert("_dm".to_string(), vec![6]);
++        vars.insert("_dy".to_string(), vec![2019]);
++        assert_eq!(finish(&vars, &After::Date), "date 21 7 2019");
++        assert_eq!(finish(&HashMap::new(), &After::Pos), "pos ? (no position came back)");
++    }
+ }

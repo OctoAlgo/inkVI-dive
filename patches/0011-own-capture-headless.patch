@@ -1,0 +1,57 @@
+From 7e294d3e6871fe07a177316b98f1ea0385e3f93e Mon Sep 17 00:00:00 2001
+From: Octo <180629317+OctoAlgo@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:39:31 +0100
+Subject: [PATCH 11/11] VICTORY_CAPTURE saves frames with no swap chain too
+ (RTX 5070 Ti on Xvfb)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Kit-Source: own (inkVI-dive, captures)
+Kit-Licence: GPL-3.0
+---
+ crates/victory-gpu/src/host.rs | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 21e9ecc11..5981eb4ba 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -16417,6 +16417,10 @@ impl Host {
+                 Ok(p) => Some(p),
+                 Err(e) => {
+                     tracing::warn!(error = %e, "no swap chain");
++                    // LOCAL (octo, inkVI-dive): with no swap chain (the RTX 5070 Ti on Xvfb: "surface is not
++                    // supported for presentation") VICTORY_CAPTURE still saves the title's frame.
++                    #[cfg(feature = "diagnostics")]
++                    self.capture_headless(texture, state, frame);
+                     return None;
+                 }
+             };
+@@ -16585,6 +16589,28 @@ impl Host {
+         }
+     }
+ 
++    /// LOCAL (octo, inkVI-dive): a wanted frame read back and saved without a swap chain.
++    #[cfg(feature = "diagnostics")]
++    fn capture_headless(&self, texture: &ID3D12Resource, state: u32, frame: u64) {
++        if !crate::capture::wanted(frame) {
++            return;
++        }
++        let Ok(copy) = self.new_list() else { return };
++        let state = D3D12_RESOURCE_STATES(state as i32);
++        // SAFETY: our new open list and a live source texture; executed and waited for before the save.
++        unsafe {
++            let list = &copy.list;
++            crate::barstat::record(&list, crate::barstat::Why::Present, &[transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
++            let capture = crate::capture::read_back(&self.device, list, texture);
++            crate::barstat::record(&list, crate::barstat::Why::Present, &[transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
++            copy.close();
++            self.execute(&[&copy]);
++            if let Some((buffer, footprint)) = capture {
++                crate::capture::save_read_back(frame, &buffer, &footprint);
++            }
++        }
++    }
++
+     fn presenter(
+         &self,
+         width: u32,

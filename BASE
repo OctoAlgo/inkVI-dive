@@ -1,0 +1,5 @@
+INKVI_URL=https://github.com/OctoAlgo/inkVI
+INKVI_COMMIT=55bf837946acbdc813eefb25897afc8ca9120c9e
+INKVI_BASE_COMMIT=4c60466140f4bccd2252427b6f2cfbc658c16906
+# inkVI v0.2.1 (tag v0.2.1): victory-fork 4c6046614 + 38 patches; its own BASE pins the fork commit (INKVI_BASE_COMMIT
+# repeats it, and build.sh checks the two agree).

@@ -1,0 +1,40 @@
+# natives-names.txt: names for GTA VI 1.0.2.1 script natives (VICTORY_NATIVES_NAMES). `NAME 0x<hash>`; the names are
+# OURS (GTA V-style, by observed behaviour; named after what they were seen to do in traces of the running game), the hashes are the
+# title's own (embedded in each handler).
+GET_CLOCK_HOURS 0x3d4e6e6637d30df7
+GET_CLOCK_MINUTES 0x47dc2440b1e9ddce
+GET_CLOCK_SECONDS 0x9d4a0f7f49efe541
+ADD_TO_CLOCK_TIME 0x88fe2cc95483dae3
+SET_CLOCK_TIME 0x1772f4e2fe7b8af5
+SET_CLOCK_DATE 0xa9d6be1dfd52cf6d
+PLAYER_PED_ID 0x6471f11ff69d8a77
+GET_ENTITY_COORDS 0x6c660bb25792a0f9
+SET_ENTITY_COORDS 0xa3df0fc3f6e71ca9
+GET_CLOCK_DAY_OF_WEEK 0x804cff89b22fd2b3
+GET_CLOCK_DAY_OF_MONTH 0x3abb7f5a20d02869
+GET_CLOCK_MONTH 0x86154e53d2bb1703
+GET_CLOCK_YEAR 0x73b5b7451ec9235d
+GET_ENTITY_HEADING 0x91d0aaf83dcf226a
+SET_ENTITY_HEADING 0xba3b9ae430d463f9
+# Scenes (cutscenes; README "Cutscenes"). SCENE_CREATE is a native; the rest are methods of the
+# scene object it returns (`NAME m+0x<rva>`: called by address, first argument the object).
+SCENE_CREATE 0x6e60c14fb1196778
+SCENE_REQUEST 0x873f10c9063a3585
+SCENE_EXISTS 0xee566962a01b2640
+SCENE_LOAD m+0x19ab850
+SCENE_IS_PLAYING m+0x4bfe6d0
+SCENE_IS_READY m+0x4bfd760
+SCENE_START m+0x4bfe460
+SCENE_IS_ACTIVE m+0x4c017a0
+SCENE_GET_PHASE m+0x4bff1a0
+SCENE_HAS_ENDED m+0x4bfe790
+SCENE_JUST_ENDED m+0x4bfe850
+SCENE_IS_STATE_8 m+0x4c01920
+SCENE_STOP m+0x4bfe0e0
+SCENE_SET_ENTITY m+0x4bffc30
+# never call by hand (its 2nd argument is a script function; anything else crashes the game when the event fires):
+SCENE_ON_EVENT m+0x4bfdb10
+SCENE_ON_EVENT_E m+0x4bfdbb0
+SET_FOCUS_POS 0x15882a4ec477d569
+SET_FOCUS_ENTITY 0x3d5e3d9c92683648
+GET_CAM_COORD 0x13d4be90acad1fda

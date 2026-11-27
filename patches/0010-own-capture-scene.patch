@@ -1,0 +1,182 @@
+From bb8e2860b8daefc7f05c0683ca4f27fb3e686449 Mon Sep 17 00:00:00 2001
+From: Octo <180629317+OctoAlgo@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:38:08 +0100
+Subject: [PATCH 10/11] VICTORY_CAPTURE_SCENE=0x<name>:<a>-<b> captures after
+ every start of a scene; channel command cap [<n>]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Kit-Source: own (inkVI-dive, captures)
+Kit-Licence: GPL-3.0
+---
+ crates/victory-gpu/src/capture.rs    | 50 +++++++++++++++++++++++++++-
+ crates/victory-gpu/src/debugcmd.rs   | 13 ++++++++
+ crates/victory-loader/src/natives.rs | 36 ++++++++++++++++++++
+ 3 files changed, 98 insertions(+), 1 deletion(-)
+
+diff --git a/crates/victory-gpu/src/capture.rs b/crates/victory-gpu/src/capture.rs
+index da63efd74..5b173a8ff 100644
+--- a/crates/victory-gpu/src/capture.rs
++++ b/crates/victory-gpu/src/capture.rs
+@@ -181,7 +181,55 @@ pub(crate) fn wanted(n: u64) -> bool {
+     // run, so single frames cannot be compared between runs).
+     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
+-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || in_secs(n))
++    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || in_secs(n) || asked(n) || in_scene(n))
++}
++
++/// LOCAL (octo, inkVI-dive): frames the debug channel's `cap [<n>]` asked for: `(first << 32) | last` (presents).
++static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// LOCAL (octo, inkVI-dive): saves the `count` frames after present `now` (the debug channel's `cap`).
++pub(crate) fn ask(now: u64, count: u64) -> bool {
++    if folder().is_none() {
++        return false;
++    }
++    let (a, b) = ((now + 1) & 0xffff_ffff, (now + count.max(1)) & 0xffff_ffff);
++    ASKED.store((a << 32) | b, std::sync::atomic::Ordering::Relaxed);
++    true
++}
++
++fn asked(n: u64) -> bool {
++    let v = ASKED.load(std::sync::atomic::Ordering::Relaxed);
++    v != 0 && n >= v >> 32 && n <= (v & 0xffff_ffff)
++}
++
++/// LOCAL (octo, inkVI-dive): `VICTORY_CAPTURE_SCENE=0x<name>:<a>-<b>`: every frame presented between `a` and `b`
++/// seconds of wall time after ANY start of the scene (cutscene) of that name hash, by a script or by the debug
++/// channel's `scene play` (needs `VICTORY_NATIVES` and the names file). Each new start opens the window again, so
++/// a cutscene and its replays are all saved. Decided once per frame, like `VICTORY_CAPTURE_SECS`.
++fn in_scene(n: u64) -> bool {
++    use std::sync::atomic::Ordering::Relaxed;
++    static WINDOW: std::sync::OnceLock<Option<(u32, f64, f64)>> = std::sync::OnceLock::new();
++    let Some((name, a, b)) = *WINDOW.get_or_init(|| {
++        let v = std::env::var("VICTORY_CAPTURE_SCENE").ok()?;
++        let (name, secs) = v.split_once(':')?;
++        let name = u32::from_str_radix(name.trim().trim_start_matches("0x"), 16).ok()?;
++        let (a, b) = secs.split_once('-')?;
++        Some((name, a.trim().parse().ok()?, b.trim().parse().ok()?))
++    }) else {
++        return false;
++    };
++    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
++    let last = LAST.load(Relaxed);
++    if last != u64::MAX && last >> 1 == n {
++        return last & 1 == 1;
++    }
++    let t = victory_loader::natives::since_scene_start(name);
++    let yes = t.is_some_and(|t| t >= a && t <= b);
++    LAST.store((n << 1) | u64::from(yes), Relaxed);
++    if yes {
++        tracing::info!(frame = n, secs = t, scene = format_args!("{name:#010x}"), "VICTORY_CAPTURE_SCENE: frame in the window");
++    }
++    yes
+ }
+ 
+ /// LOCAL (octo, inkVI-dive): when world frame 0 was presented (`VICTORY_CAPTURE_WORLD`).
+diff --git a/crates/victory-gpu/src/debugcmd.rs b/crates/victory-gpu/src/debugcmd.rs
+index ba36af763..95409215d 100644
+--- a/crates/victory-gpu/src/debugcmd.rs
++++ b/crates/victory-gpu/src/debugcmd.rs
+@@ -780,6 +780,19 @@ pub(crate) fn present(frame: u64) {
+     }
+     for line in run_now {
+         let began = std::time::Instant::now();
++        // LOCAL (octo, inkVI-dive): `cap [<n>]` saves the next n frames (1) with VICTORY_CAPTURE's settings.
++        let words: Vec<&str> = line.split_whitespace().collect();
++        if words.first() == Some(&"cap") {
++            let n: u64 = words.get(1).and_then(|w| w.parse().ok()).unwrap_or(1);
++            let reply = if crate::capture::ask(frame, n) {
++                format!("cap: presents {}..{} are saved", frame + 1, frame + n.max(1))
++            } else {
++                "error: cap needs VICTORY_CAPTURE".to_string()
++            };
++            tracing::info!(cmd = %line, "VICTORY_DEBUG: {reply}");
++            ch.replies.push(format!("[{stamp}] > {line}\n{reply}\n"));
++            continue;
++        }
+         let reply = match victory_loader::natives::command(&line, &ch.folder) {
+             victory_loader::natives::Reply::NotOurs => ch.exec.run(&line),
+             victory_loader::natives::Reply::Now(Ok(text)) => text,
+diff --git a/crates/victory-loader/src/natives.rs b/crates/victory-loader/src/natives.rs
+index e38c65f7b..825c8c619 100644
+--- a/crates/victory-loader/src/natives.rs
++++ b/crates/victory-loader/src/natives.rs
+@@ -352,6 +352,9 @@ struct State {
+     methods: HashMap<String, usize>,
+     /// The scene-create native (the name `SCENE_CREATE`), 0 if not named: its calls fill `scenes`.
+     create_rva: usize,
++    /// LOCAL (octo, inkVI-dive): the scene-start method (the name `SCENE_START`), 0 if not named: its calls
++    /// (by a script or by the channel) fill `STARTS`.
++    start_rva: usize,
+     scenes: Mutex<Vec<Scene>>,
+     started: Instant,
+     queue: Mutex<Queue>,
+@@ -550,6 +553,7 @@ pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
+     let (names, methods) = read_names();
+     let by_hash: HashMap<u64, usize> = found.iter().map(|&(rva, h)| (h, rva)).collect();
+     let create_rva = names.get("SCENE_CREATE").and_then(|h| by_hash.get(h)).copied().unwrap_or(0);
++    let state_start_rva = methods.get("SCENE_START").copied().unwrap_or(0);
+     let state = State {
+         base,
+         size,
+@@ -558,6 +562,7 @@ pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
+         names,
+         methods,
+         create_rva,
++        start_rva: state_start_rva,
+         scenes: Mutex::new(Vec::new()),
+         started: Instant::now(),
+         queue: Mutex::new(Queue { next_id: 1, ..Queue::default() }),
+@@ -683,6 +688,25 @@ fn near_image(base: usize, size: usize, len: usize) -> Option<usize> {
+     None
+ }
+ 
++/// LOCAL (octo, inkVI-dive): the last start of each scene name (`VICTORY_CAPTURE_SCENE` keys captures on it).
++static STARTS: Mutex<Vec<(u32, Instant)>> = Mutex::new(Vec::new());
++
++/// A scene object was started (SCENE_START by a script or by the channel): notes when, under its name.
++#[cfg(windows)]
++fn note_start(st: &State, obj: u64, script: u32) {
++    let Some(name) = lock(&st.scenes).iter().rev().find(|s| s.obj == obj).map(|s| s.name) else { return };
++    let mut starts = lock(&STARTS);
++    starts.retain(|(n, _)| *n != name);
++    starts.push((name, Instant::now()));
++    tracing::info!(name = format_args!("{name:#010x}"), obj = format_args!("{obj:#x}"), script = format_args!("{script:#x}"),
++        ms = st.started.elapsed().as_millis() as u64, "{ENV}: scene started");
++}
++
++/// Seconds since the scene named `name` was last started, if it was.
++pub fn since_scene_start(name: u32) -> Option<f64> {
++    lock(&STARTS).iter().find(|(n, _)| *n == name).map(|(_, at)| at.elapsed().as_secs_f64())
++}
++
+ /// A NUL-terminated printable string at `p`, if `p` points at readable memory.
+ #[cfg(windows)]
+ fn string_at(p: u64) -> Option<String> {
+@@ -766,6 +790,15 @@ unsafe extern "win64" fn dispatch(ctx: *mut Ctx, handler: usize, sctx: usize, by
+             }
+         }
+     }
++    if st.start_rva != 0 && handler.wrapping_sub(st.base) == st.start_rva {
++        // SAFETY: as above; the method's first argument is the scene object.
++        unsafe {
++            let c = &*ctx;
++            if c.argc >= 1 && !c.args.is_null() {
++                note_start(st, c.args.read_unaligned(), script_id(sctx));
++            }
++        }
++    }
+     if memwatch {
+         // SAFETY: as above.
+         unsafe { mem_check(st, Some((&*ctx, handler)), sctx) };
+@@ -1023,6 +1056,9 @@ unsafe fn run_queue(st: &State, sctx: usize) {
+             }
+             note_scene(st, args[0], args[1], ret[0], script);
+         }
++        if st.start_rva != 0 && call.rva == st.start_rva && !args.is_empty() {
++            note_start(st, args[0], script);
++        }
+         let rets = &ret[..call.nret.clamp(1, 16)];
+         let show = |v: &[u64]| v.iter().map(|x| fmt_slot(*x)).collect::<Vec<_>>().join(" ");
+         let mut text = format!("#{} {} -> ret [{}]{kept}", call.id, call.text, show(rets));

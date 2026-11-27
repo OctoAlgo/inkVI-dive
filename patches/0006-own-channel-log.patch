@@ -1,0 +1,62 @@
+From 1b0b7f47508619218c52f5a05f9335df890a78ad Mon Sep 17 00:00:00 2001
+From: Octo <180629317+OctoAlgo@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:28:44 +0100
+Subject: [PATCH 06/11] the channel's log.txt gets each reply once
+
+reply.txt holds the whole answer to the current cmd file and was appended to log.txt in full every
+time a queued result came back (34 MB after one run with 400 waiting lines). Now only the new
+replies are appended.
+Checked in the game with this build (run nat7, cell checkpoint): pos, date, scene list, peek with a
+hexadecimal length, `scene play 0xfa252252 as=lucia` (the cell's opening cutscene plays again from
+the channel: camera at its place, clock 15:00, bars up, ended after ~110 world frames), tpgo back.
+Run nat6 (Chapter 1 opening) had the montage replayed twice with `scene play 0x97f69b27 as=jason`.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Kit-Source: own (inkVI-dive)
+Kit-Licence: GPL-3.0
+---
+ crates/victory-gpu/src/debugcmd.rs | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-gpu/src/debugcmd.rs b/crates/victory-gpu/src/debugcmd.rs
+index fba1dfeac..ba36af763 100644
+--- a/crates/victory-gpu/src/debugcmd.rs
++++ b/crates/victory-gpu/src/debugcmd.rs
+@@ -691,6 +691,8 @@ struct Channel {
+     pending: Vec<(u64, u32)>,
+     /// The last world frame the natives trace was marked with.
+     marked: Option<u64>,
++    /// How many of `replies` are in `log.txt` already (each reply is logged once).
++    logged: usize,
+ }
+ 
+ /// Presents an `ncall` waits for its script-thread result before it is given up (`done` waits for it).
+@@ -714,7 +716,7 @@ fn channel() -> Option<&'static Mutex<Channel>> {
+             let exec = Executor::new(live::Process, &folder);
+             tracing::info!(folder = %folder.display(), base = format_args!("{:#x}", exec.mem.image_base()), ?exec.settings,
+                 "debug command channel on (VICTORY_DEBUG): lines of the file `cmd` run every fourth present; replies in reply.txt");
+-            Some(Mutex::new(Channel { folder, exec, later: Vec::new(), replies: Vec::new(), pending: Vec::new(), marked: None }))
++            Some(Mutex::new(Channel { folder, exec, later: Vec::new(), replies: Vec::new(), pending: Vec::new(), marked: None, logged: 0 }))
+         })
+         .as_ref()
+ }
+@@ -739,6 +741,7 @@ pub(crate) fn present(frame: u64) {
+                 Ok(()) => {
+                     let _ = std::fs::remove_file(ch.folder.join("done"));
+                     ch.replies.clear();
++                    ch.logged = 0;
+                     new_cmd = true;
+                     let (now, later) = schedule(&text, world);
+                     run_now.extend(now);
+@@ -794,7 +797,10 @@ pub(crate) fn present(frame: u64) {
+     let _ = std::fs::write(ch.folder.join("reply.txt"), &text);
+     if let Ok(mut log) = std::fs::OpenOptions::new().append(true).create(true).open(ch.folder.join("log.txt")) {
+         use std::io::Write as _;
+-        let _ = log.write_all(text.as_bytes());
++        // Only what is new: `reply.txt` is the whole answer to the current `cmd`, `log.txt` every answer once.
++        let new: String = ch.replies[ch.logged.min(ch.replies.len())..].concat();
++        let _ = log.write_all(new.as_bytes());
++        ch.logged = ch.replies.len();
+     }
+     if ch.later.is_empty() && ch.pending.is_empty() {
+         let _ = std::fs::write(ch.folder.join("done"), format!("{stamp}\n"));

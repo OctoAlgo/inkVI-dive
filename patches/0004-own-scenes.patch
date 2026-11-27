@@ -1,0 +1,549 @@
+From 30634e652cd5f3d863cba9d33583eca226f8be61 Mon Sep 17 00:00:00 2001
+From: Octo <180629317+OctoAlgo@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 09:51:32 +0100
+Subject: [PATCH 04/11] scene (cutscene) commands, script-class methods and
+ waiting calls in the debug channel
+
+GTA VI 1.0.2.1 makes a cutscene with one native (name hash, flags) and drives it through methods
+of the script object that native returns (the by-ID call path). So:
+ * ncall takes m+0x<rva> (a method called by address, checked to be a function start) and names of
+   methods (`NAME m+0x<rva>` lines of the names file); wait=<secs> repeats a call every 100 ms until
+   its first return slot is not 0; a call whose $variable is not set is not made;
+ * every scene a script creates is remembered (the native named SCENE_CREATE): scene list;
+ * scene use | new | ent | load | wait | start | state | stop | play, over the names SCENE_* of the
+   names file (no title address in the code);
+ * a scene created from the channel: the script heap is garbage collected and nothing holds the
+   returned object (seen freed within 90 s in run nat4), so the scene's id is moved into a block of
+   ours and the script object is left with id 0 (untested at this commit: run nat5);
+ * peek takes a hexadecimal length.
+Checked in the game (nat4, cell checkpoint): pos / tp with heading / time / date / tpsave / tpgo /
+tpmarks, scene list, scene use + state, and SCENE_START on the mission's own ready scene.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Kit-Source: own (inkVI-dive)
+Kit-Licence: GPL-3.0
+---
+ crates/victory-gpu/src/debugcmd.rs   |   5 +-
+ crates/victory-loader/src/natives.rs | 333 ++++++++++++++++++++++++---
+ 2 files changed, 308 insertions(+), 30 deletions(-)
+
+diff --git a/crates/victory-gpu/src/debugcmd.rs b/crates/victory-gpu/src/debugcmd.rs
+index d33479525..fba1dfeac 100644
+--- a/crates/victory-gpu/src/debugcmd.rs
++++ b/crates/victory-gpu/src/debugcmd.rs
+@@ -384,7 +384,7 @@ impl<M: Memory> Executor<M> {
+             "help" => Ok("base | peek <addr> <len> | peekf <addr> <n> | poke <addr> <hex> | pokef <addr> <f>... | \
+                 scan [<zmin> <zmax>] | findptr <lo> <hi> | chain <addr> [<off>...] | matrix <off>... | pos | \
+                 tp <x> <y> <z> [<heading>] | time <hh> <mm> | save <name> | goto <name> | marks | settings | \
+-                nhelp (script natives: ncall, nstat, ntrace, ndump, nmark, nwatch, nscript, nfind)"
++                nhelp (script natives: ncall, pos, tp, time, date, tpsave, tpgo, tpmarks, scene, nstat, ntrace, ndump, nlog, nmark, nwatch, nscript, nfind)"
+                 .into()),
+             "base" => {
+                 let b = self.mem.image_base();
+@@ -398,7 +398,8 @@ impl<M: Memory> Executor<M> {
+             )),
+             "peek" => {
+                 let addr = self.addr(args.first().ok_or("peek <addr> <len>")?)?;
+-                let len: usize = Self::num(args.get(1), "length")?;
++                // A length may be hexadecimal too (`peek img+0xab5cdc0 0x20`).
++                let len: usize = args.get(1).and_then(|w| parse_addr(w, 0)).ok_or("missing or bad length")?;
+                 let len = len.min(0x10000);
+                 let b = self.mem.read(addr, len).ok_or_else(|| format!("{} unreadable", self.img(addr)))?;
+                 Ok(format!("{}\n{}", self.img(addr), hexdump(addr, &b).trim_end()))
+diff --git a/crates/victory-loader/src/natives.rs b/crates/victory-loader/src/natives.rs
+index c1ef34992..526aa5230 100644
+--- a/crates/victory-loader/src/natives.rs
++++ b/crates/victory-loader/src/natives.rs
+@@ -22,7 +22,7 @@
+ use std::collections::{HashMap, VecDeque};
+ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Mutex, MutexGuard, OnceLock};
+-use std::time::Instant;
++use std::time::{Duration, Instant};
+ 
+ /// Environment variable: `1` = hook + call queue, `trace` = also the trace.
+ pub const ENV: &str = "VICTORY_NATIVES";
+@@ -74,8 +74,31 @@ struct Call {
+     store: Option<String>,
+     text: String,
+     after: Option<After>,
++    /// `wait=<secs>`: the call is repeated (every [`WAIT_STEP`]) until its first return slot is not 0.
++    wait: Option<Duration>,
++    deadline: Option<Instant>,
++    not_before: Option<Instant>,
++    tries: u32,
++    /// Not a call: sets a variable when its turn in the queue comes (`scene use`).
++    set: Option<(String, Vec<u64>)>,
+ }
+ 
++/// How often a waiting call (`wait=<secs>`) is repeated.
++const WAIT_STEP: Duration = Duration::from_millis(100);
++
++/// A scene (cutscene) object a script, or the channel, made with the title's create native.
++#[derive(Clone, Debug, PartialEq)]
++pub struct Scene {
++    pub name: u32,
++    pub flags: u64,
++    pub obj: u64,
++    pub script: u32,
++    pub ms: u64,
++}
++
++/// Scenes remembered (the newest).
++const SCENES_MAX: usize = 256;
++
+ /// What a shorthand command (`pos`, `tp`, `time`, `date`, `tpsave`, `tpgo`) reports once its last call has run.
+ #[derive(Clone, Debug, PartialEq)]
+ pub enum After {
+@@ -87,6 +110,8 @@ pub enum After {
+     Date,
+     /// The position line, also written to the bookmarks file under `name`.
+     Save { name: String, file: std::path::PathBuf },
++    /// The current scene's state (`scene state`).
++    Scene,
+ }
+ 
+ /// One teleport bookmark: a line `name x y z heading pitch [hh:mm]` (the debug channel's bookmarks file).
+@@ -154,6 +179,12 @@ fn finish(vars: &HashMap<String, Vec<u64>>, after: &After) -> String {
+     if *after == After::Time {
+         return time;
+     }
++    if *after == After::Scene {
++        let obj = vars.get("_scene").and_then(|v| v.first()).copied().unwrap_or(0);
++        let flag = |name: &str| int(name).map_or("?".to_string(), |v| (v & 0xff).to_string());
++        let phase = vars.get("_sp").and_then(|v| v.first()).map_or("?".to_string(), |v| format!("{:.4}", f(*v)));
++        return format!("scene {obj:#x} ready {} playing {} phase {phase} ended {}", flag("_sy"), flag("_sl"), flag("_se"));
++    }
+     if *after == After::Date {
+         // The title counts months from 0 (as its date setter does); the command and the reply from 1.
+         return match (int("_dd"), int("_dm"), int("_dy")) {
+@@ -242,6 +273,11 @@ struct State {
+     by_hash: HashMap<u64, usize>,
+     by_rva: HashMap<usize, u64>,
+     names: HashMap<String, u64>,
++    /// Names of script-class methods (`NAME m+0x<rva>` lines of the names file): called by address.
++    methods: HashMap<String, usize>,
++    /// The scene-create native (the name `SCENE_CREATE`), 0 if not named: its calls fill `scenes`.
++    create_rva: usize,
++    scenes: Mutex<Vec<Scene>>,
+     started: Instant,
+     queue: Mutex<Queue>,
+     trace: Mutex<Trace>,
+@@ -415,13 +451,18 @@ pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
+         let mut old = 0;
+         VirtualProtect(place as _, 0x1000, PAGE_EXECUTE_READ, &mut old);
+     }
+-    let names = read_names();
++    let (names, methods) = read_names();
++    let by_hash: HashMap<u64, usize> = found.iter().map(|&(rva, h)| (h, rva)).collect();
++    let create_rva = names.get("SCENE_CREATE").and_then(|h| by_hash.get(h)).copied().unwrap_or(0);
+     let state = State {
+         base,
+         size,
+-        by_hash: found.iter().map(|&(rva, h)| (h, rva)).collect(),
++        by_hash,
+         by_rva: found.iter().copied().collect(),
+         names,
++        methods,
++        create_rva,
++        scenes: Mutex::new(Vec::new()),
+         started: Instant::now(),
+         queue: Mutex::new(Queue { next_id: 1, ..Queue::default() }),
+         trace: Mutex::new(Trace::default()),
+@@ -468,22 +509,59 @@ pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
+ }
+ 
+ #[cfg(windows)]
+-fn read_names() -> HashMap<String, u64> {
+-    let mut names = HashMap::new();
+-    let Some(path) = std::env::var_os(NAMES_ENV) else { return names };
++fn read_names() -> (HashMap<String, u64>, HashMap<String, usize>) {
++    let Some(path) = std::env::var_os(NAMES_ENV) else { return Default::default() };
+     let Ok(text) = std::fs::read_to_string(&path) else {
+         tracing::warn!(path = %std::path::Path::new(&path).display(), "{NAMES_ENV}: the file could not be read");
+-        return names;
++        return Default::default();
+     };
++    parse_names(&text)
++}
++
++/// The names file: `NAME 0x<hash>` (a native) and `NAME m+0x<rva>` (a script-class method, called by address)
++/// lines; `#` comments.
++pub fn parse_names(text: &str) -> (HashMap<String, u64>, HashMap<String, usize>) {
++    let (mut names, mut methods) = (HashMap::new(), HashMap::new());
+     for line in text.lines() {
+         let mut w = line.split_whitespace();
+-        if let (Some(name), Some(hash)) = (w.next(), w.next()) {
+-            if let Some(h) = hash.strip_prefix("0x").and_then(|h| u64::from_str_radix(h, 16).ok()) {
++        if let (Some(name), Some(value)) = (w.next(), w.next()) {
++            if name.starts_with('#') {
++                continue;
++            }
++            if let Some(h) = value.strip_prefix("0x").and_then(|h| u64::from_str_radix(h, 16).ok()) {
+                 names.insert(name.to_ascii_uppercase(), h);
++            } else if let Some(r) = value.strip_prefix("m+0x").and_then(|r| usize::from_str_radix(r, 16).ok()) {
++                methods.insert(name.to_ascii_uppercase(), r);
+             }
+         }
+     }
+-    names
++    (names, methods)
++}
++
++/// Whether `rva` is where a function of the mapped image begins (its function table).
++///
++/// # Safety
++/// `base` is a mapped PE image of `size` bytes.
++unsafe fn function_start(base: usize, size: usize, rva: usize) -> bool {
++    // SAFETY: the headers and the function table of a mapped image.
++    unsafe {
++        let rd32 = |at: usize| (at as *const u32).read_unaligned() as usize;
++        let nt = base + rd32(base + 0x3c);
++        let (dir, len) = (rd32(nt + 0x18 + 0x70 + 3 * 8), rd32(nt + 0x18 + 0x70 + 3 * 8 + 4));
++        dir != 0 && dir + len <= size && (0..len / 12).any(|i| rd32(base + dir + i * 12) == rva)
++    }
++}
++
++fn note_scene(st: &State, name: u64, flags: u64, obj: u64, script: u32) {
++    if obj == 0 {
++        return;
++    }
++    let mut scenes = lock(&st.scenes);
++    scenes.retain(|s| s.obj != obj);
++    if scenes.len() >= SCENES_MAX {
++        scenes.remove(0);
++    }
++    scenes.push(Scene { name: name as u32, flags, obj, script, ms: st.started.elapsed().as_millis() as u64 });
+ }
+ 
+ /// Memory of ours for `len` bytes within 2 GiB of the image (above its
+@@ -579,6 +657,15 @@ unsafe extern "win64" fn dispatch(ctx: *mut Ctx, handler: usize, sctx: usize, by
+     }
+     // SAFETY: the call the title asked for.
+     unsafe { std::mem::transmute::<usize, unsafe extern "win64" fn(*mut Ctx)>(handler)(ctx) };
++    if st.create_rva != 0 && handler.wrapping_sub(st.base) == st.create_rva {
++        // SAFETY: the context of the call that just returned: its arguments and its return slot.
++        unsafe {
++            let c = &*ctx;
++            if c.argc >= 2 && !c.args.is_null() && !c.ret.is_null() {
++                note_scene(st, c.args.read_unaligned(), c.args.add(1).read_unaligned(), c.ret.read_unaligned(), script_id(sctx));
++            }
++        }
++    }
+     if memwatch {
+         // SAFETY: as above.
+         unsafe { mem_check(st, Some((&*ctx, handler)), sctx) };
+@@ -746,24 +833,46 @@ unsafe fn run_queue(st: &State, sctx: usize) {
+     // SAFETY: the interpreter's context.
+     let script = unsafe { script_id(sctx) };
+     loop {
+-        let (call, args) = {
++        let (mut call, args) = {
+             let mut q = lock(&st.queue);
+             if q.only_script != 0 && q.only_script != script {
+                 return;
+             }
++            // A waiting call is tried again only after its step; the calls behind it wait with it.
++            if q.calls.front().and_then(|c| c.not_before).is_some_and(|t| Instant::now() < t) {
++                return;
++            }
+             let Some(call) = q.calls.pop_front() else {
+                 QUEUED.store(0, Ordering::Relaxed);
+                 return;
+             };
+             QUEUED.store(q.calls.len(), Ordering::Relaxed);
++            if let Some((name, value)) = &call.set {
++                q.vars.insert(name.clone(), value.clone());
++                q.done.insert(call.id, format!("#{} {}", call.id, call.text));
++                continue;
++            }
+             let mut args: Vec<u64> = Vec::new();
++            let mut missing = None;
+             for a in &call.args {
+                 match a {
+                     Arg::Val(v) => args.push(*v),
+-                    Arg::Var(name, None) => args.extend(q.vars.get(name).cloned().unwrap_or_default()),
+-                    Arg::Var(name, Some(i)) => args.push(q.vars.get(name).and_then(|v| v.get(*i)).copied().unwrap_or(0)),
++                    Arg::Var(name, i) => match (q.vars.get(name), i) {
++                        (Some(v), None) => args.extend(v),
++                        (Some(v), Some(i)) if *i < v.len() => args.push(v[*i]),
++                        _ => missing = Some(name.clone()),
++                    },
+                 }
+             }
++            if let Some(name) = missing {
++                // A method given a null object would fault: the call is not made.
++                let mut text = format!("#{} {}: error: ${name} is not set; not called", call.id, call.text);
++                if let Some(after) = &call.after {
++                    text = format!("{text}\n{}", finish(&q.vars, after));
++                }
++                q.done.insert(call.id, text);
++                continue;
++            }
+             (call, args)
+         };
+         let argc = args.len();
+@@ -771,13 +880,55 @@ unsafe fn run_queue(st: &State, sctx: usize) {
+         slots.resize(argc + 16, 0);
+         let mut ret = [0u64; 16];
+         let mut ctx = Ctx { args: slots.as_mut_ptr(), ret: ret.as_mut_ptr(), argc: argc as u32, retc: call.nret as u32 };
+-        tracing::info!(id = call.id, script = format_args!("{script:#x}"), "{ENV}: calling {}", call.text);
+-        // SAFETY: a native handler of this image (checked when queued), called
+-        // as the interpreter calls it, on a script thread.
++        if call.tries == 0 {
++            tracing::info!(id = call.id, script = format_args!("{script:#x}"), "{ENV}: calling {}", call.text);
++        }
++        // SAFETY: a native handler of this image, or a function of it the names file or the caller
++        // gave as a script method (checked when queued), called as the interpreter calls it, on a
++        // script thread.
+         unsafe { std::mem::transmute::<usize, unsafe extern "win64" fn(*mut Ctx)>(st.base + call.rva)(&mut ctx) };
++        call.tries += 1;
++        let mut timed_out = false;
++        if let Some(wait) = call.wait {
++            if ret[0] == 0 {
++                let now = Instant::now();
++                let deadline = *call.deadline.get_or_insert(now + wait);
++                if now < deadline {
++                    call.not_before = Some(now + WAIT_STEP);
++                    let mut q = lock(&st.queue);
++                    q.calls.push_front(call);
++                    QUEUED.store(q.calls.len(), Ordering::Relaxed);
++                    return;
++                }
++                timed_out = true;
++            }
++        }
++        let mut kept = String::new();
++        if st.create_rva != 0 && call.rva == st.create_rva && args.len() >= 2 {
++            // The script heap is garbage collected and no script variable holds this object: left alone
++            // it is collected within seconds and its scene with it. So the scene's id (the object's
++            // third field, the only one the methods read) is moved into a block of ours, and the script
++            // object is left with id 0, for which its finaliser has nothing to release.
++            let obj = ret[0] as usize;
++            if obj > 0x1_0000 {
++                // SAFETY: the 18h-byte object the create native returned just now, on this thread.
++                let own = unsafe {
++                    let p = obj as *mut u64;
++                    let own = [p.read_unaligned(), p.add(1).read_unaligned(), p.add(2).read_unaligned()];
++                    p.add(2).write_unaligned(0);
++                    own
++                };
++                kept = format!(" (scene id {:#x} taken over from the script object {obj:#x}: it outlives the garbage collector)", own[2]);
++                ret[0] = Box::leak(Box::new(own)).as_ptr() as u64;
++            }
++            note_scene(st, args[0], args[1], ret[0], script);
++        }
+         let rets = &ret[..call.nret.clamp(1, 16)];
+         let show = |v: &[u64]| v.iter().map(|x| fmt_slot(*x)).collect::<Vec<_>>().join(" ");
+-        let mut text = format!("#{} {} -> ret [{}]", call.id, call.text, show(rets));
++        let mut text = format!("#{} {} -> ret [{}]{kept}", call.id, call.text, show(rets));
++        if call.wait.is_some() {
++            text.push_str(&format!(" ({} after {} calls)", if timed_out { "WAIT TIMED OUT" } else { "waited: true" }, call.tries));
++        }
+         if call.nret == 2 {
+             let f = |v: u64| f32::from_bits(v as u32);
+             text.push_str(&format!(" vec({:.3}, {:.3}, {:.3})", f(ret[0]), f(ret[0] >> 32), f(ret[1])));
+@@ -870,9 +1021,20 @@ fn target(st: &State, word: &str) -> Result<usize, String> {
+     if let Some(h) = word.strip_prefix("0x") {
+         return by_hash(u64::from_str_radix(h, 16).map_err(|_| format!("bad hash {word}"))?);
+     }
+-    match st.names.get(&word.to_ascii_uppercase()) {
+-        Some(h) => by_hash(*h),
+-        None => Err(format!("unknown native {word} (a name of {NAMES_ENV}, 0x<hash> or +0x<rva>)")),
++    // A script-class method (or any function with the natives' calling convention), by address: only checked
++    // to be where a function of the image begins.
++    let method = |rva: usize| {
++        // SAFETY: the mapped title image.
++        if unsafe { function_start(st.base, st.size, rva) } { Ok(rva) } else { Err(format!("m+{rva:#x} is not where a function begins")) }
++    };
++    if let Some(r) = word.strip_prefix("m+0x") {
++        return method(usize::from_str_radix(r, 16).map_err(|_| format!("bad rva {word}"))?);
++    }
++    let upper = word.to_ascii_uppercase();
++    match (st.names.get(&upper), st.methods.get(&upper)) {
++        (Some(h), _) => by_hash(*h),
++        (None, Some(rva)) => method(*rva),
++        _ => Err(format!("unknown native {word} (a name of {NAMES_ENV}, 0x<hash>, +0x<rva>, or m+0x<rva> for a method)")),
+     }
+ }
+ 
+@@ -895,7 +1057,7 @@ pub fn command(line: &str, folder: &std::path::Path) -> Reply {
+     if !matches!(
+         cmd,
+         "ncall" | "nstat" | "ntrace" | "ndump" | "nmark" | "nwatch" | "nscript" | "nfind" | "nhelp" | "npos" | "ntp" | "ntime" | "nwatchmem" | "nlog"
+-            | "pos" | "tp" | "time" | "date" | "tpsave" | "tpgo" | "tpmarks"
++            | "pos" | "tp" | "time" | "date" | "tpsave" | "tpgo" | "tpmarks" | "scene"
+     ) {
+         return Reply::NotOurs;
+     }
+@@ -913,7 +1075,8 @@ pub fn command(line: &str, folder: &std::path::Path) -> Reply {
+             nstat | ntrace on|off | ndump | nmark <label> | nwatch <native>|off | nscript <id>|any | nfind <native> | \
+             nwatchmem +0x<rva>:<len>[,...]|off | nlog [<from call> [<to call>]] (needs VICTORY_NATIVES=log) | npos | ntp <x> <y> <z> | ntime <hh> <mm> | \
+             through the title's own natives: pos | tp <x> <y> <z> [<heading>] | time [<hh> <mm> [<ss>]] | date [<day> <month> <year>] | \
+-            tpsave <name> | tpgo <name> | tpmarks"
++            tpsave <name> | tpgo <name> | tpmarks | scenes (cutscenes): scene list | use <name|0xhash> | new <name|0xhash> [<flags>] | \
++            ent <role> | load | wait [<secs>] | start | state | stop | play <name|0xhash> [<flags>] [as=<role>]; ncall also takes m+0x<rva> (a method) and wait=<secs>"
+             .into()));
+     }
+     let Some(st) = STATE.get() else {
+@@ -926,9 +1089,41 @@ pub fn command(line: &str, folder: &std::path::Path) -> Reply {
+             Err(e) => Reply::Now(Err(e)),
+         },
+         // Position, teleport, clock and bookmarks through the title's own natives (names file).
+-        "pos" | "tp" | "time" | "date" | "tpsave" | "tpgo" => {
++        "scene" if args.first() == Some(&"list") => {
++            let scenes = lock(&st.scenes);
++            let lines: Vec<String> = scenes
++                .iter()
++                .map(|s| format!("name {:#010x} flags {:#x} object {:#x} by script {:#x} at {} ms", s.name, s.flags, s.obj, s.script, s.ms))
++                .collect();
++            Reply::Now(Ok(if lines.is_empty() { "no scene was created yet (needs the name SCENE_CREATE in the names file)".into() } else { lines.join("\n") }))
++        }
++        "scene" if args.first() == Some(&"use") => {
++            let Some(want) = args.get(1).and_then(|w| scene_name(w).ok()) else {
++                return Reply::Now(Err("scene use <name|0xhash|0xobject>: a scene of `scene list`".into()));
++            };
++            let scenes = lock(&st.scenes);
++            // By object first (two scenes can have one name), else the newest of that name.
++            match scenes.iter().rev().find(|s| s.obj == want).or_else(|| scenes.iter().rev().find(|s| u64::from(s.name) == want)) {
++                Some(s) => {
++                    // Queued, so it takes effect in order with the scene commands before and after it.
++                    let text = format!("scene = object {:#x} (name {:#010x}, made by script {:#x})", s.obj, s.name, s.script);
++                    let mut q = lock(&st.queue);
++                    let id = q.next_id;
++                    q.next_id += 1;
++                    q.calls.push_back(Call {
++                        id, rva: 0, args: Vec::new(), nret: 0, store: None, text: text.clone(), after: None, wait: None, deadline: None, not_before: None, tries: 0,
++                        set: Some(("_scene".into(), vec![s.obj])),
++                    });
++                    QUEUED.store(q.calls.len(), Ordering::Relaxed);
++                    Reply::Queued(vec![id], format!("queued #{id}: {text}"))
++                }
++                None => Reply::Now(Err(format!("no scene {want:#x} in `scene list`"))),
++            }
++        }
++        "pos" | "tp" | "time" | "date" | "tpsave" | "tpgo" | "scene" => {
+             let known = |name: &str| st.names.get(name).is_some_and(|h| st.by_hash.contains_key(h));
+-            let plan = match shorthand(cmd, args, &marks_file(folder), &known) {
++            let plan = if cmd == "scene" { scene_lines(args) } else { shorthand(cmd, args, &marks_file(folder), &known) };
++            let plan = match plan {
+                 Ok(plan) => plan,
+                 Err(e) => return Reply::Now(Err(e)),
+             };
+@@ -1151,14 +1346,62 @@ pub fn shorthand(cmd: &str, args: &[&str], marks: &std::path::Path, known: &dyn
+     }
+ }
+ 
+-/// Queues one call: `<native> [ret=<n>] [><var>] [<arg>...]`.
++/// A scene's name as the create native takes it: `0x<hash>`, or text (hashed).
++pub fn scene_name(word: &str) -> Result<u64, String> {
++    match word.strip_prefix("0x") {
++        Some(h) => u64::from_str_radix(h, 16).map_err(|_| format!("bad hash {word}")),
++        None => Ok(u64::from(joaat(word))),
++    }
++}
++
++/// The `ncall` lines of a `scene` command (the title's scene natives and methods under the names
++/// `SCENE_*` of the names file) and what to report at the end. The object of the last `scene new` /
++/// `scene use` is the variable `$_scene`.
++pub fn scene_lines(args: &[&str]) -> Result<(Vec<String>, After), String> {
++    let state = || {
++        ["SCENE_IS_READY >_sy $_scene 0", "SCENE_IS_PLAYING >_sl $_scene 0", "SCENE_GET_PHASE >_sp $_scene", "SCENE_HAS_ENDED >_se $_scene 0"].map(String::from).to_vec()
++    };
++    // As the title's own scripts create a cutscene: flags 220h, 0, 0, 1.
++    let new = |name: &str, flags: Option<&&str>| -> Result<String, String> {
++        let flags = flags.map_or(Ok(0x220), |f| scene_name(f).map_err(|_| format!("bad flags {f}")))?;
++        Ok(format!("SCENE_CREATE >_scene {:#x} {flags:#x} 0 0 1", scene_name(name)?))
++    };
++    let secs = |w: Option<&&str>, default: f32| w.map_or(Ok(default), |w| w.parse::<f32>().map_err(|_| format!("bad seconds {w}")));
++    let lines = match args {
++        ["new", name] | ["new", name, _] => vec![new(name, args.get(2))?],
++        ["ent", role] => vec!["PLAYER_PED_ID ret=2 >_ped".to_string(), format!("SCENE_SET_ENTITY $_scene {:#x} $_ped 0", scene_name(role)?)],
++        ["load"] => vec!["SCENE_LOAD $_scene".to_string()],
++        ["wait"] | ["wait", _] => vec![format!("SCENE_IS_READY >_sy $_scene 0 wait={}", secs(args.get(1), 60.0)?)],
++        ["start"] => vec!["SCENE_START $_scene".to_string()],
++        ["stop"] => vec!["SCENE_STOP $_scene 1 1 1".to_string()],
++        ["state"] => Vec::new(),
++        // As the title's scripts do it for a cutscene: create, clear the flags 3, 4, 8 and 16h, the player as
++        // the role named by `as=<role>` if given, load, wait until ready, start.
++        ["play", name, rest @ ..] => {
++            let mut v = vec![new(name, rest.iter().find(|w| !w.starts_with("as=")))?];
++            v.extend([3, 4, 8, 0x16].map(|n| format!("SCENE_SET_FLAG $_scene buf:8 {n} 0 0")));
++            if let Some(role) = rest.iter().find_map(|w| w.strip_prefix("as=")) {
++                v.push("PLAYER_PED_ID ret=2 >_ped".to_string());
++                v.push(format!("SCENE_SET_ENTITY $_scene {:#x} $_ped 0", scene_name(role)?));
++            }
++            v.extend(["SCENE_LOAD $_scene", "SCENE_IS_READY >_sy $_scene 0 wait=120", "SCENE_START $_scene"].map(String::from));
++            v
++        }
++        _ => return Err("scene list | use <name|0xhash|0xobject> | new <name|0xhash> [<flags>] | ent <role> | load | wait [<secs>] | start | state | stop | play <name|0xhash> [<flags>] [as=<role>]".into()),
++    };
++    Ok((lines.into_iter().chain(state()).collect(), After::Scene))
++}
++
++/// Queues one call: `<native> [ret=<n>] [><var>] [wait=<secs>] [<arg>...]`.
+ fn queue_call(st: &State, args: &[&str], after: Option<After>) -> Result<(u64, String), String> {
+     let name = args.first().ok_or("ncall <native> [ret=<n>] [><var>] [<arg>...]")?;
+     let rva = target(st, name)?;
+-    let (mut nret, mut store, mut parsed) = (1usize, None, Vec::new());
++    let (mut nret, mut store, mut parsed, mut wait) = (1usize, None, Vec::new(), None);
+     for w in &args[1..] {
+         if let Some(n) = w.strip_prefix("ret=") {
+             nret = n.parse::<usize>().ok().filter(|n| *n <= 16).ok_or_else(|| format!("bad {w}"))?;
++        } else if let Some(n) = w.strip_prefix("wait=") {
++            wait = Some(Duration::from_secs_f32(n.parse::<f32>().ok().filter(|n| (0.0..=3600.0).contains(n)).ok_or_else(|| format!("bad {w}"))?));
+         } else if let Some(v) = w.strip_prefix('>') {
+             store = Some(v.to_string());
+         } else {
+@@ -1168,8 +1411,9 @@ fn queue_call(st: &State, args: &[&str], after: Option<After>) -> Result<(u64, S
+     let mut q = lock(&st.queue);
+     let id = q.next_id;
+     q.next_id += 1;
+-    let text = format!("{name} (+{rva:#x}, hash {:#018x}) {}", st.by_rva[&rva], args[1..].join(" "));
+-    q.calls.push_back(Call { id, rva, args: parsed, nret, store, text: text.clone(), after });
++    let what = st.by_rva.get(&rva).map_or("a method".to_string(), |h| format!("hash {h:#018x}"));
++    let text = format!("{name} (+{rva:#x}, {what}) {}", args[1..].join(" "));
++    q.calls.push_back(Call { id, rva, args: parsed, nret, store, text: text.clone(), after, wait, deadline: None, not_before: None, tries: 0, set: None });
+     QUEUED.store(q.calls.len(), Ordering::Relaxed);
+     Ok((id, format!("queued #{id}: {text}")))
+ }
+@@ -1304,6 +1548,39 @@ mod tests {
+         assert_eq!(fmt_slot(7), "0x7");
+     }
+ 
++    #[test]
++    fn scenes_and_names() {
++        let (names, methods) = parse_names("# comment\nSCENE_CREATE 0x6e60c14fb1196778\nscene_start m+0x4bfe460\nBAD x\n");
++        assert_eq!(names.get("SCENE_CREATE"), Some(&0x6e60_c14f_b119_6778));
++        assert_eq!(methods.get("SCENE_START"), Some(&0x4bf_e460));
++        assert_eq!(names.len() + methods.len(), 2);
++        assert_eq!(scene_name("0xf2d9d324"), Ok(0xf2d9_d324));
++        assert_eq!(scene_name("adder"), Ok(0xb779_a091));
++        let (calls, after) = scene_lines(&["play", "0xf2d9d324"]).unwrap();
++        assert_eq!(calls[0], "SCENE_CREATE >_scene 0xf2d9d324 0x220 0 0 1");
++        assert_eq!(calls[1], "SCENE_SET_FLAG $_scene buf:8 3 0 0");
++        assert_eq!(calls[4], "SCENE_SET_FLAG $_scene buf:8 22 0 0");
++        assert_eq!(calls[5], "SCENE_LOAD $_scene");
++        assert_eq!(calls[6], "SCENE_IS_READY >_sy $_scene 0 wait=120");
++        assert_eq!(calls[7], "SCENE_START $_scene");
++        let (calls, _) = scene_lines(&["play", "0xf2d9d324", "0x0", "as=lucia"]).unwrap();
++        assert_eq!(calls[0], "SCENE_CREATE >_scene 0xf2d9d324 0x0 0 0 1");
++        assert_eq!(calls[6], "SCENE_SET_ENTITY $_scene 0x2fe5af54 $_ped 0");
++        assert_eq!(calls.last().unwrap(), "SCENE_HAS_ENDED >_se $_scene 0");
++        assert_eq!(after, After::Scene);
++        assert_eq!(scene_lines(&["new", "adder", "0x0"]).unwrap().0[0], "SCENE_CREATE >_scene 0xb779a091 0x0 0 0 1");
++        assert_eq!(scene_lines(&["ent", "lucia"]).unwrap().0[1], "SCENE_SET_ENTITY $_scene 0x2fe5af54 $_ped 0");
++        assert_eq!(scene_lines(&["state"]).unwrap().0.len(), 4);
++        assert!(scene_lines(&["wait", "x"]).is_err());
++        assert!(scene_lines(&[]).is_err());
++        let mut vars = HashMap::new();
++        vars.insert("_scene".to_string(), vec![0x1_2cdc_7970]);
++        vars.insert("_sl".to_string(), vec![1]);
++        vars.insert("_sy".to_string(), vec![1]);
++        vars.insert("_sp".to_string(), vec![u64::from(0.25f32.to_bits())]);
++        assert_eq!(finish(&vars, &After::Scene), "scene 0x12cdc7970 ready 1 playing 1 phase 0.2500 ended ?");
++    }
++
+     #[test]
+     fn shorthands_and_bookmarks() {
+         let none = std::path::Path::new("/nonexistent/bookmarks.txt");

@@ -4,7 +4,7 @@ Date: Fri, 27 Nov 2026 07:56:50 +0100
 Subject: [PATCH 02/11] VICTORY_NATIVES: call the title's script natives from
  the debug channel
 
-GTA VI 1.0.2.1 has no natives table: each of the 6820 handlers holds its own 64-bit hash
+The title (1.0.2.1) has no natives table: each of the 6820 handlers holds its own 64-bit hash
 (`cmp dword [rcx+10h], 0` ... `movabs r, hash ; mov [args], r`), and scripts call them by code
 offset from the interpreter's NATIVE opcode (+0x3de7411). VICTORY_NATIVES=1|trace|log (diagnostics
 build, title executable of that build only):
@@ -214,7 +214,7 @@ index 000000000..58107bfb9
 +//! LOCAL (octo, inkVI-dive): the title's script natives, for
 +//! the diagnostics build's debug channel.
 +//!
-+//! GTA VI 1.0.2.1 (how it was found: the inkVI-dive README):
++//! The title, build 1.0.2.1 (how it was found: the inkVI-dive README):
 +//!  * a script native is a function `handler(ctx)` with
 +//!    `ctx = { args: *mut u64, ret: *mut u64, argc: u32, retc: u32 }`; every
 +//!    handler starts with `cmp dword [rcx+10h], 0` and holds its own 64-bit

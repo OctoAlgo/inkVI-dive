@@ -231,7 +231,7 @@ index 000000000..7b62a0ca0
 +}
 +
 +/// Heading in degrees from the forward row: 0 = +y (north), 90 = -x
-+/// (west), the GTA convention.
++/// (west), the title's convention.
 +pub(crate) fn heading_of(forward: &[f32]) -> f32 {
 +    let h = (-forward[0]).atan2(forward[1]).to_degrees();
 +    if h < 0.0 { h + 360.0 } else { h }

@@ -4,7 +4,7 @@ Date: Fri, 27 Nov 2026 09:51:32 +0100
 Subject: [PATCH 04/11] scene (cutscene) commands, script-class methods and
  waiting calls in the debug channel
 
-GTA VI 1.0.2.1 makes a cutscene with one native (name hash, flags) and drives it through methods
+The title (1.0.2.1) makes a cutscene with one native (name hash, flags) and drives it through methods
 of the script object that native returns (the by-ID call path). So:
  * ncall takes m+0x<rva> (a method called by address, checked to be a function start) and names of
    methods (`NAME m+0x<rva>` lines of the names file); wait=<secs> repeats a call every 100 ms until

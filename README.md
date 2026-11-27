@@ -131,6 +131,19 @@ Diagnostics build, with `VICTORY_CAPTURE=<folder>`:
 | `VICTORY_CAPTURE_SCENE=0x<name>:<a>-<b>` | every frame from a to b seconds after each start of that cutscene, the title's or the channel's (needs `VICTORY_NATIVES`) |
 | `cap [<n>]` (channel) | the next n frames |
 
+To share the exact frames from a running session, request a short burst
+and wait for the corresponding PNG or raw files to finish writing:
+
+```sh
+python3 tools/capture-receipt.py ~/dive/channel ~/dive/captures --count 3 > capture.json
+```
+
+The JSON gives each title Present number, local filename, dimensions, byte
+count and file SHA-256. Use a separate capture directory per run and one
+command sender per channel. Attach the receipt with your scene, build,
+profile and settings when reporting a comparison. Image hashes identify
+the files from that run. Independently rendered frames can differ.
+
 Cutscenes keep to the wall clock, not to frames: at a low frame rate a short shot is only a few frames, wherever the
 capture starts. Without a swap chain (a second card on a virtual X server: "surface is not supported for
 presentation") wanted frames are still read back and saved.

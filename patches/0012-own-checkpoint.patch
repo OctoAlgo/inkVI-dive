@@ -1,4 +1,4 @@
-From 27f04ea26d848936f5d17c07aabd20e17f8e5fec Mon Sep 17 00:00:00 2001
+From f95edaf4e0acccebb37b2d439d0788f66e28da8c Mon Sep 17 00:00:00 2001
 From: Octo <180629317+OctoAlgo@users.noreply.github.com>
 Date: Fri, 27 Nov 2026 23:56:56 +0100
 Subject: [PATCH] checkpoint: jump to a stage of the running mission; stage
@@ -13,19 +13,19 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Kit-Source: own (inkVI-dive, checkpoints)
 Kit-Licence: GPL-3.0
 ---
- crates/victory-gpu/src/checkpoint.rs | 687 +++++++++++++++++++++++++++
- crates/victory-gpu/src/debugcmd.rs   |  98 +++-
+ crates/victory-gpu/src/checkpoint.rs | 700 +++++++++++++++++++++++++++
+ crates/victory-gpu/src/debugcmd.rs   |  91 +++-
  crates/victory-gpu/src/lib.rs        |   3 +
  crates/victory-loader/src/natives.rs |  66 +++
- 4 files changed, 852 insertions(+), 2 deletions(-)
+ 4 files changed, 858 insertions(+), 2 deletions(-)
  create mode 100644 crates/victory-gpu/src/checkpoint.rs
 
 diff --git a/crates/victory-gpu/src/checkpoint.rs b/crates/victory-gpu/src/checkpoint.rs
 new file mode 100644
-index 0000000..ed015c0
+index 0000000..5eaa3a5
 --- /dev/null
 +++ b/crates/victory-gpu/src/checkpoint.rs
-@@ -0,0 +1,687 @@
+@@ -0,0 +1,700 @@
 +//! LOCAL (octo, inkVI-dive): `checkpoint`, a test tool that jumps to a stage
 +//! (checkpoint) of the mission that is running, for the diagnostics build's
 +//! debug channel.
@@ -293,6 +293,8 @@ index 0000000..ed015c0
 +    const SETTLE: Duration = Duration::from_secs(2);
 +    /// A retry this recent: no teleport (a teleport about 40 s after a retry crashed the title once).
 +    const AFTER_RETRY: Duration = Duration::from_secs(60);
++    /// How long the field may stay empty after the retry before the reply says so.
++    const CONFIRM_WAIT: Duration = Duration::from_secs(20);
 +    /// How long a queued `pos` / `tp` may take.
 +    const CALL_WAIT: Duration = Duration::from_secs(60);
 +
@@ -307,6 +309,9 @@ index 0000000..ed015c0
 +        Tp { ids: Vec<u64> },
 +        /// Waiting for the title's retry.
 +        Retry,
++        /// The title retried at `stage` after `secs`; waiting for the field to hold a stage again (it is cleared
++        /// while the mission script restarts).
++        Confirm { stage: u32, secs: f64, until: Instant },
 +    }
 +
 +    /// What one step of a job gives the channel.
@@ -577,16 +582,9 @@ index 0000000..ed015c0
 +                Phase::Retry => {
 +                    let events = natives::stage_events_after(self.seq0);
 +                    if let Some(e) = events.iter().find(|e| e.restart != 0) {
-+                        let field = reread(mem, self.slot, &self.stages).map_or("not a stage now".to_string(), |h| name(h.stage));
-+                        let secs = self.phase_at.elapsed().as_secs_f64();
-+                        let ok = e.stage == self.ask.target;
-+                        let text = format!(
-+                            "the title retried the mission {secs:.0} s after the teleport at {} ({}); the field reads {field}. \
-+                             The clock stands still until the stage has loaded: no teleport (and no checkpoint) until `pos` shows it moving",
-+                            name(e.stage),
-+                            if ok { "the stage asked for" } else { "NOT the stage asked for" },
-+                        );
-+                        return self.end(text, ok);
++                        let (stage, secs) = (e.stage, self.phase_at.elapsed().as_secs_f64());
++                        self.go(Phase::Confirm { stage, secs, until: Instant::now() + CONFIRM_WAIT });
++                        return Step { lines: std::mem::take(&mut self.lines), ended: false, slot: Some(self.slot) };
 +                    }
 +                    if let Some(e) = events.iter().find(|e| e.restart == 0 && e.stage != self.ask.target) {
 +                        let text = format!("note: the title announced {} (no retry) while waiting", name(e.stage));
@@ -602,6 +600,21 @@ index 0000000..ed015c0
 +                            ),
 +                            false,
 +                        );
++                    }
++                }
++                Phase::Confirm { stage, secs, until } => {
++                    let (stage, secs, until) = (*stage, *secs, *until);
++                    let field = reread(mem, self.slot, &self.stages);
++                    if field.is_some() || Instant::now() >= until {
++                        let ok = stage == self.ask.target && field.is_none_or(|h| h.stage == stage);
++                        let text = format!(
++                            "the title retried the mission {secs:.0} s after the teleport at {} ({}); the field reads {}. \
++                             No teleport (and no checkpoint) for a while: wait until `pos` shows the clock moving",
++                            name(stage),
++                            if stage == self.ask.target { "the stage asked for" } else { "NOT the stage asked for" },
++                            field.map_or(format!("no stage yet after {} s", CONFIRM_WAIT.as_secs()), |h| name(h.stage)),
++                        );
++                        return self.end(text, ok);
 +                    }
 +                }
 +            }
@@ -714,7 +727,7 @@ index 0000000..ed015c0
 +    }
 +}
 diff --git a/crates/victory-gpu/src/debugcmd.rs b/crates/victory-gpu/src/debugcmd.rs
-index 41b0dcd..f9a48c8 100644
+index 41b0dcd..57bf664 100644
 --- a/crates/victory-gpu/src/debugcmd.rs
 +++ b/crates/victory-gpu/src/debugcmd.rs
 @@ -384,6 +384,7 @@ impl<M: Memory> Executor<M> {
@@ -734,7 +747,7 @@ index 41b0dcd..f9a48c8 100644
 +    /// The last stage announcement logged (its call number, and (stage, restart flag)).
 +    stage_seq: u64,
 +    stage_last: Option<(u32, u32)>,
-+    /// The stage field once `checkpoint` found it, and its last value: every change is logged.
++    /// The stage field once `checkpoint` found it, and the last stage it held: every change to another stage is logged.
 +    field: Option<(usize, u64)>,
  }
  
@@ -760,7 +773,7 @@ index 41b0dcd..f9a48c8 100644
          })
          .as_ref()
  }
-@@ -775,6 +795,56 @@ pub(crate) fn present(frame: u64) {
+@@ -775,6 +795,49 @@ pub(crate) fn present(frame: u64) {
          }
          ch.pending = still;
      }
@@ -776,18 +789,11 @@ index 41b0dcd..f9a48c8 100644
 +        }
 +    }
 +    if let Some((at, last)) = ch.field.filter(|_| frame.is_multiple_of(4)) {
++        // Only stages are logged: while the title restarts a mission the field passes through other values.
 +        let now = ch.exec.mem.read(at, 8).map(|b| u64::from_le_bytes(b[..8].try_into().unwrap_or_default()));
-+        if now != Some(last) {
-+            match now.filter(|v| v >> 32 == 1) {
-+                Some(v) => {
-+                    stage_lines.push(format!("stage field {at:#x}: {} -> {}", crate::checkpoint::name(last as u32), crate::checkpoint::name(v as u32)));
-+                    ch.field = Some((at, v));
-+                }
-+                None => {
-+                    stage_lines.push(format!("stage field {at:#x} no longer holds a stage ({}): not watched any more", now.map_or("unreadable".into(), |v| format!("{v:#x}"))));
-+                    ch.field = None;
-+                }
-+            }
++        if let Some(v) = now.filter(|v| v >> 32 == 1 && *v as u32 != last as u32) {
++            stage_lines.push(format!("stage field {at:#x}: {} -> {}", crate::checkpoint::name(last as u32), crate::checkpoint::name(v as u32)));
++            ch.field = Some((at, v));
 +        }
 +    }
 +    if !stage_lines.is_empty() {
@@ -817,7 +823,7 @@ index 41b0dcd..f9a48c8 100644
      if run_now.is_empty() && !new_cmd && !results {
          return;
      }
-@@ -793,6 +863,30 @@ pub(crate) fn present(frame: u64) {
+@@ -793,6 +856,30 @@ pub(crate) fn present(frame: u64) {
              ch.replies.push(format!("[{stamp}] > {line}\n{reply}\n"));
              continue;
          }
@@ -848,7 +854,7 @@ index 41b0dcd..f9a48c8 100644
          let reply = match victory_loader::natives::command(&line, &ch.folder) {
              victory_loader::natives::Reply::NotOurs => ch.exec.run(&line),
              victory_loader::natives::Reply::Now(Ok(text)) => text,
-@@ -815,7 +909,7 @@ pub(crate) fn present(frame: u64) {
+@@ -815,7 +902,7 @@ pub(crate) fn present(frame: u64) {
          let _ = log.write_all(new.as_bytes());
          ch.logged = ch.replies.len();
      }

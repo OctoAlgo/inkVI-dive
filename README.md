@@ -247,9 +247,7 @@ them: a `tp` streams the area in and holds the player until the ground is there.
 
 ## Next
 
-- Shareable test cases: a save point, a spot, a time and the frames to compare.
-- A one-key snapshot in a running session (screenshot plus position, camera, clock, settings and the log's tail, to
-  reproduce an issue).
+Next: shareable test cases (stage, scene and capture window in one file, with receipts), a 'seconds until settled' measure for how long a scene takes to stream in after a cut, and stages beyond Chapter 1.
 
 After that: a basic UI for the commands, an in-game menu or overlay, so the commands need no terminal.
 

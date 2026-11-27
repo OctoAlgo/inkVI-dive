@@ -1,6 +1,6 @@
 # inkVI-dive
 
-Test tooling for GTA VI on VIctory: teleport, bookmarks, clock, and cutscene replay from a command channel.
+Test tooling for VIctory: teleport, bookmarks, clock, and cutscene replay from a command channel.
 
 **A testing aid, work in progress.** It is for people who test VIctory builds and want to get the game to a place, a
 time of day or a cutscene without playing there. Tested on Linux under Proton with NVIDIA cards only (RTX 5090,
@@ -41,6 +41,13 @@ paths, as the layer sees them; under Proton `Z:\` is the Linux root):
     VICTORY_NATIVES=1                                            # the natives hook
     VICTORY_NATIVES_NAMES='Z:\home\you\inkVI-dive\tools\natives-names.txt'
     VICTORY_DEBUG_BOOKMARKS='Z:\home\you\dive\bookmarks.txt'    # optional; tools/bookmarks.example.txt to start from
+
+**Which Proton:** we run on Proton 11 with a patched wineserver that keeps memory views in a tree
+([CachyOS/wine-cachyos PR #50](https://github.com/CachyOS/wine-cachyos/pull/50),
+[Wine bug 60868](https://bugs.winehq.org/show_bug.cgi?id=60868)) and with warm shader and pipeline caches. On stock
+Proton 11 with cold caches the same build ran at 1-2 frames a second and models and textures did not stream in, on both
+cards. If your Wine already has that fix you need nothing extra; say which Proton and whether the caches were warm
+next to any number you report.
 
 Then, from any shell, while the game runs:
 
@@ -147,7 +154,8 @@ again without playing through the opening:
 
        dcmd.sh <channel> "nscript 0x72e73a29" "scene play 0x97f69b27 as=jason"
 
-What we saw (RTX 5090, 3840x2160, render scale 1.0, 5-6 frames a second): the iguana is the full textured model in
+What we saw (RTX 5090, 3840x2160, render scale 1.0, 5-6 frames a second; 32:9 tests will come with the next
+inkVI-ultrawide update): the iguana is the full textured model in
 the title's own pass and in the replays. The replays are lit differently: bright and sunlit in one, a black
 silhouette in the others (also on an RTX 5070 Ti). A replay from the channel runs without the title's cutscene handlers (see Limits), so take
 lighting differences between passes as an effect of the tool, not of the game. At about 1-2 frames a second the first
@@ -190,8 +198,8 @@ them: a `tp` streams the area in and holds the player until the ground is there.
 - **Far teleports and missions.** During a mission a far `tp` fails the mission by distance, not because of the
   jump: in the Chapter 1 opening (boat stage) steps of 25, 50, 100 and 200 m west of the dock held, and at 300 m the
   mission restarted within 10 s (the player put back, the clock frozen). A `tp` shortly after such a restart crashed
-  the game inside the title's own teleport: wait until the mission runs again (`pos` shows the clock moving). Outside
-  missions, far teleports have been fine.
+  the game inside the title's own teleport: wait until the mission runs again (`pos` shows the clock moving). Far
+  teleports outside missions are untested (we have no free-roam save yet).
 - **One crash cause to avoid:** never call `SCENE_ON_EVENT` (`m+0x4bfdb10` / `m+0x4bfdbb0`) by hand. Its second
   argument is a script function; anything else is called as one when the event fires and the game faults.
 - `ncall` with a wrong argument count or a made-up pointer can crash the game, and `m+0x<rva>` with a wrong address
@@ -210,7 +218,7 @@ checkpoints.
 
 - [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and [Marvisak/VIctory](https://github.com/Marvisak/VIctory):
   the base, through inkVI.
-- The name hash (Jenkins one-at-a-time over lower-cased text) and the GTA V-style native names are community
+- The name hash (Jenkins one-at-a-time over lower-cased text) and the naming style of the script natives are community
   knowledge; every hash, address and behaviour here was read from our own copy of the title and checked in the game.
 
 ## What this kit ships, and what it does not

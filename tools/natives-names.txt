@@ -1,5 +1,5 @@
-# natives-names.txt: names for GTA VI 1.0.2.1 script natives (VICTORY_NATIVES_NAMES). `NAME 0x<hash>`; the names are
-# OURS (GTA V-style, by observed behaviour; named after what they were seen to do in traces of the running game), the hashes are the
+# natives-names.txt: names for the title's 1.0.2.1 script natives (VICTORY_NATIVES_NAMES). `NAME 0x<hash>`; the names are
+# OURS (community naming style, by observed behaviour; named after what they were seen to do in traces of the running game), the hashes are the
 # title's own (embedded in each handler).
 GET_CLOCK_HOURS 0x3d4e6e6637d30df7
 GET_CLOCK_MINUTES 0x47dc2440b1e9ddce

@@ -45,24 +45,12 @@ and `checkpoint #<n>` there. Whether the jump works in the next missions is not 
 **Open: the real skip.** Starting any mission directly, without playing up to it, is an open question. We have no
 lead that works yet. If you want to look into it, see [issue #ISSUE_NUMBER](https://github.com/OctoAlgo/inkVI-dive/issues/ISSUE_NUMBER).
 
-## Tip: skip the start screen without a fixed timer
+## Tip: past the start screen at once
 
-Watch two pixels of the game's picture at 1920x1080: one inside the white (A) circle of "PLAYER (A)" at the bottom
-right, **x 1874, y 1034**, colour (249, 249, 249), and one on the dark background just right of it, **x 1900,
-y 1034**, colour (32, 32, 44). Press A when the first is white (every channel 200 or more) and the second is dark
-(every channel 80 or less) in two samples in a row. The background pixel is there so that a white flash does not
-trigger it. In the title's own 3840x2160 frame (what `cap` saves on the Series X profile) the same points are
-x 3748, y 2069 and x 3800, y 2069.
-
-Checked on full-size captures from three runs (RTX 5070 Ti): the rule held on all 80 captures of the start screen
-and on none of the 54 others (black frames, the intro movie, the loading screen, the world). We caught no white
-flash. The 1920x1080 points are those of the full-size frame scaled down. Other sizes and aspects are not measured
-yet. A built-in version is planned for a later dive version.
-
-Until then, a simple way in: `VICTORY_SKIP_BINK=1 VICTORY_KEYS=r1/10:Enter` presses Enter every 10 presents from the
-first one until the world runs, so the start screen is passed without watching it. On an RTX 5090 that took 29.6 s
-from launch to world frame 25, in one run. It is a convenience, not a measured gain: in an earlier test on the
-RTX 5070 Ti, pressing that often from the first frame was not faster than the slower timer (`r300/30:Enter`).
+`VICTORY_KEYS=r1/10:Enter` presses Enter every 10 presents from the first one until the world runs. On an RTX 5090
+it passed the start screen 5.2 s after launch, the same moment as pressing A by hand as soon as the screen showed
+(5.2 s). A timer that starts later (`r300/30:Enter`) left the start screen waiting about 9 s more. With
+`VICTORY_SKIP_BINK=1` too, the world ran 29.6 s after launch. One run each.
 
 ## Tested
 

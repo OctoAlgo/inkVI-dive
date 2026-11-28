@@ -44,7 +44,7 @@ title's own save menu. One session, one mission.
 and `checkpoint #<n>` there. Whether the jump works in the next missions is not tested yet.
 
 **Open: the real skip.** Starting any mission directly, without playing up to it, is an open question. We have no
-lead that works yet. If you want to look into it, see [issue #ISSUE_NUMBER](https://github.com/OctoAlgo/inkVI-dive/issues/ISSUE_NUMBER).
+lead that works yet. If you want to look into it, see [issue #2](https://github.com/OctoAlgo/inkVI-dive/issues/2).
 
 ## Tip: past the start screen at once
 

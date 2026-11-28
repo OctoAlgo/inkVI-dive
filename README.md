@@ -114,7 +114,8 @@ the Chapter 1 opening (four known stages, `ch1-s1` .. `ch1-s4`); nothing else is
 Limits, up front: Chapter 1 stages only; a mission must be running (one that fails by distance); the jump fails the
 mission on purpose; passing a mission, free roam and later chapters are not shown; a forward jump skips whatever the
 skipped stages would have set, so never keep playing on that save; the field's address differs by build (it is found
-fresh every time, and the command refuses if it does not find exactly one); copies of saves only. Every stage the
+fresh every time, and the command refuses if it does not find exactly one); the far teleport it uses crashed the
+title in 2 of 17 tries so far; copies of saves only. Every stage the
 title announces is written to the channel's `log.txt`, so new stages can be recorded. Details, options and how it
 works: [docs/checkpoints.md](docs/checkpoints.md).
 

@@ -12,7 +12,14 @@
 - New: a worked example, [A study on "clown vomit" (user-coined term)](docs/case-study-clown-vomit.md): how to use
   dive to catch a picture fault that only shows sometimes.
 
-Checked: RESULTS-TBD
+Checked: Four runs of a clean-clone build of this branch, Linux, Proton 11 (memory-view-tree wineserver), warm caches, Series X profile, copies of a save at the start of Chapter 1. The field was found unique every time (another address on each card). The far teleport crashed the title once (2 of 17 far teleports in the Chapter 1 opening so far, counting earlier tests).
+
+| card | direction | from -> to | result |
+|---|---|---|---|
+| RTX 5070 Ti | backward | ch1-s3 -> ch1-s2 | retry 14 s after the teleport at ch1-s2; montage and boat cutscene again, then ch1-s3 by itself (2 runs) |
+| RTX 5070 Ti | forward | ch1-s3 -> ch1-s4 | retry 14-15 s after the teleport at ch1-s4; in the boat on the river, control returned (2 runs) |
+| RTX 5090 | backward | ch1-s3 -> ch1-s2 | 1st run: the title crashed in its own teleport (the fail step). 2nd run: retry 16 s after at ch1-s2, as on the Ti |
+| RTX 5090 | forward | ch1-s3 -> ch1-s4 | retry 16 s after the teleport at ch1-s4; in the boat on the river, control returned |
 
 ## v0.1 (first version, work in progress) - on inkVI v0.2.1, eleven patches
 

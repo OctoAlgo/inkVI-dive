@@ -26,6 +26,10 @@ Diagnostics build only, with `VICTORY_NATIVES=1` and the kit's `tools/natives-na
   teleport. `checkpoint` refuses while the clock stands still and for 60 s after a retry, and it never teleports
   after the retry it caused. Some stages hold the clock (ch1-s4 does); `force` skips the clock test there, but still
   waits 120 s after a retry.
+- **The far teleport can crash the title.** Its own teleport faulted in 2 of 17 far teleports in the Chapter 1
+  opening so far: once about 40 s after a retry, once in a v0.2 test on the RTX 5090 with the clock moving and no
+  retry before (the same fault both times). The next run of the same test passed. Keep nothing you need in that
+  session.
 - Tested on Linux under Proton with NVIDIA cards only (RTX 5090, RTX 5070 Ti).
 
 ## Commands
@@ -99,7 +103,14 @@ itself is only proven for Chapter 1.
 
 ## Tested
 
-See the release notes of v0.2 for the runs (cards, directions, stages, results).
+Four runs of a clean-clone build of this branch, Linux, Proton 11 (memory-view-tree wineserver), warm caches, Series X profile, copies of a save at the start of Chapter 1. The field was found unique every time (another address on each card). The far teleport crashed the title once (2 of 17 far teleports in the Chapter 1 opening so far, counting earlier tests).
+
+| card | direction | from -> to | result |
+|---|---|---|---|
+| RTX 5070 Ti | backward | ch1-s3 -> ch1-s2 | retry 14 s after the teleport at ch1-s2; montage and boat cutscene again, then ch1-s3 by itself (2 runs) |
+| RTX 5070 Ti | forward | ch1-s3 -> ch1-s4 | retry 14-15 s after the teleport at ch1-s4; in the boat on the river, control returned (2 runs) |
+| RTX 5090 | backward | ch1-s3 -> ch1-s2 | 1st run: the title crashed in its own teleport (the fail step). 2nd run: retry 16 s after at ch1-s2, as on the Ti |
+| RTX 5090 | forward | ch1-s3 -> ch1-s4 | retry 16 s after the teleport at ch1-s4; in the boat on the river, control returned |
 
 ## Credits
 

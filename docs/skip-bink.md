@@ -12,7 +12,7 @@ differently.
 | value | does |
 |---|---|
 | unset or `0` | nothing: every import is bound as before |
-| `1` | skips the movies that play once (logos, the intro) |
+| `1` | skips EVERY movie that plays once: the intro, and also later ones in the game (one RTX 5090 run: two more, 5 s and 47 s, 1920x1080, after the world had started; their content not checked). Leave it off to see them. |
 | `all` | skips the looping ones too; the menu backgrounds stay dark |
 
 For test runs we recommend `VICTORY_SKIP_BINK=1`.

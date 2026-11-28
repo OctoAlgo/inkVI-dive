@@ -20,7 +20,9 @@ profile), Linux under Proton, NVIDIA cards.
 ## New
 
 - Patch 0015: `VICTORY_SKIP_BINK`. Off by default. `1` skips the movies that play once (logos, the intro); `all`
-  skips the looping ones too, and then the menu backgrounds stay dark. For test runs we recommend `1`. Not our
+  skips the looping ones too, and then the menu backgrounds stay dark. `1` skips EVERY movie that plays once, not
+  only the intro: in one RTX 5090 run it also skipped two later movies, 5 s and 47 s long (1920x1080), after the
+  world had started; what they show is not checked. For test runs we recommend `1`; leave it off to see them. Not our
   code: C-GDev wrote it, CuteBooty ported it. [docs/skip-bink.md](docs/skip-bink.md).
 - Patch 0014: the stage list. `stages` prints it with numbers and marks the stages registered so far, announced
   this session, and jump tested. `checkpoint #<n>` counts in it. `memfind` and `memdump`, the raw memory commands

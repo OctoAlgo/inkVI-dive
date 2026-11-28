@@ -2,17 +2,16 @@
 
 `checkpoint` is a test and debug tool. It gets a running mission to one of its stages (checkpoints) quickly, so a
 tester can look at a stage again, or reach a later one, without playing there. It is not a mission skip, a save
-editor or a trainer, and it only knows a few stages so far.
+editor or a trainer, and the jump works in one mission so far.
 
 Diagnostics build only, with `VICTORY_NATIVES=1` and the kit's `tools/natives-names.txt` (it needs the name
 `MISSION_STAGE_SET`). The title's Xbox Series X build **1.0.2.1**, Series X profile. **Use it on copies of saves.**
 
 ## Limits first
 
-- **Chapter 1 stages only.** Ten stages of the Chapter 1 opening mission are known so far: four with labels
-  (`checkpoint list`) and six more found by playing, used by hash (table below). Other missions have stages too, but
-  their hashes are not collected yet (see "Recording new stages"). In another mission the command finds no stage
-  field and writes nothing.
+- **Jumps in Chapter 1 only.** `stages` reads the running mission's full list (24 stages in the Chapter 1 opening,
+  12 in the cell mission; see "Stage list"), but the jump works only in the Chapter 1 opening so far. In another
+  mission the command finds no stage field and writes nothing.
 - **A jump changes the stage, not your state.** What you carry stays: after a jump back to a stage before a weapon is
   handed over, you still have the weapon. A death in the game restarts at the last stage the title wrote, the same
   way as the jump.
@@ -51,8 +50,9 @@ Diagnostics build only, with `VICTORY_NATIVES=1` and the kit's `tools/natives-na
 | ch1-s3 | `0x7bf09c68` | boat gameplay at the dock |
 | ch1-s4 | `0x8cf171f3` | in the boat on the river (control returned) |
 
-Found by playing on 11-28, in this order after ch1-s4 (no labels yet; use the hash, e.g. `checkpoint 0x27788afc`;
-what each one starts is left out to avoid spoilers):
+`<stage>` can also be `#<n>`, the n-th stage of the running mission's full list (`stages`, see "Stage list"). Found
+by playing on 11-28, in this order after ch1-s4 (no labels yet; use the hash or the number, e.g. `checkpoint
+0x27788afc` or `checkpoint #9`; what each one starts is left out to avoid spoilers):
 
 | order | hash | jump tested |
 |---|---|---|
@@ -63,7 +63,8 @@ what each one starts is left out to avoid spoilers):
 | 9 | `0xf6787e02` | |
 | 10 | `0xd9ddaa4f` | |
 
-`0x4bb7a448` is announced between 8 and 9 but never written to the field, so it is not a checkpoint.
+`0x4bb7a448` is announced between 8 and 9 but never written to the field, so it is not a checkpoint. The full list
+has 24 stages; `stages` prints them all.
 
 `checkpoint list` prints these, any stage hash the title announced this session that has no label yet, the
 current stage read from the stage field, and the last stage the title announced.
@@ -81,9 +82,62 @@ then `checkpoint done: the title retried the mission ... at ch1-s2 ... the field
 - `slot=<addr>` use this field instead of looking (only if you checked it with `checkpoint list` / `peek`).
 - `force` teleport even though the clock stands still (see Limits).
 
-## Stage table
+## Stage list
 
-Since v0.2.1 the hook also records stage tables. The title registers a mission's stages one by one through a native
+Since v0.2.1, `stages` prints the running mission's full stage list, in play order, read from the title's memory.
+No stage hash has to be known for it. `checkpoint #<n>` jumps to the n-th stage of this list.
+
+    DWAIT=60 tools/dcmd.sh <channel> stages
+
+Right after the start of the Chapter 1 opening mission (2 stages registered so far):
+
+    stage list of script 0x72e73a29 (registered last): 24 stages in play order, read from memory: array 0x12c957218
+    of list object 0x12cae9050 (count 24); the reversed copy at 0x12ca91700 agrees
+      #1 0xc4c1cba4 (no label)
+      #2 ch1-s1 (0x489b8c77)  registered  announced
+      #3 ch1-s2 (0x33824f3b)  registered  jump tested
+      #4 ch1-s3 (0x7bf09c68)
+      ...
+      #13 0x835ea26a (no label)  jump tested
+      ...
+      #24 0xc10ae147 (no label)  jump tested
+    (2 of them registered so far; checkpoint #<n> counts in this list)
+
+`registered`: the mission has registered it so far (see "Registration table" below). `announced`: the title
+announced it this session. `jump tested`: a jump to it was run in our tests. `stages 0x<script>` reads the list of
+another script that registered stages (a helper of the mission).
+
+Limits:
+
+- **A stage in the list is not always a checkpoint.** In Chapter 1, #10 (`0x4bb7a448`) is never written to the stage
+  field. Jumps were tested to 7 of the 24 (#3, #5, #6, #9, #13, #14, #24). What the other stages start with is not
+  recorded.
+- **The jump itself still works in Chapter 1 only.** In the cell mission `stages` reads a list of 12, but
+  `checkpoint` finds no stage field there and writes nothing.
+- **The game stands still while it searches:** 6 to 10 s per `stages`, about 9.5 s for `checkpoint #<n>`
+  (RTX 5090). It reads all of the process's writable memory three times.
+- **It needs a mission that has registered a stage.** The registered stages are the anchors of the search.
+- **Exact or nothing.** If it does not find exactly one list, it says what it found and uses the registration table
+  instead. A helper script of the cell mission had no list it could find.
+- The structure was read in build 1.0.2.1 only. Its addresses change between runs, so none is built in.
+
+How it finds the list. The title keeps each stage of a mission as a 32-byte heap object `{type, stage hash, 0,
+pointer, 0}`, all of one type. The mission's list is a list object `{type, data, count, capacity}`. Its `data` is an
+array object: a short header that ends with the stage objects' type, then `count` pointers to the stage objects, in
+play order. `stages` takes the stages the mission has registered so far, finds their objects by shape, then every
+array of pointers to objects of that type that holds them, then each array's list object. It uses a list only if
+exactly one (by content) has a list object whose count is the array's length and holds the registered stages in
+the order they were registered. Our own search buffers are left out. A second copy, 16-byte slots `{type, stage
+hash, 0}` in reverse order, is checked against it ("the reversed copy agrees"; after one of two retries it was not
+found, which does not matter). After a retry the title builds the list again (new objects); it was found again.
+
+`memfind <u32>...` and `memdump <addr> <len>` are the two raw commands the list was found with. `memfind` writes
+every place a 4-byte value occurs (at most 2000 per value, with 64 bytes around it) to the channel's `find.txt`;
+`memdump` saves raw bytes to `dump-<addr>.bin`. Our own buffers show up in `find.txt` too.
+
+### Registration table (the fallback)
+
+The hook also records stage tables. The title registers a mission's stages one by one through a native
 (`MISSION_STAGE_ADD`, in the names file) and asks for the items of each stage through another (`MISSION_STAGE_ITEM`).
 The hook keeps, per registering script (a mission, or a helper script of it), the stages in the order they were
 registered, with how many items were asked for under each and how many times the stage was registered.
@@ -99,17 +153,13 @@ The channel's `log.txt` (and the game log) get one line per registered stage and
     [present .. world ..] stage table 0x72e73a29 #3: ch1-s3 (0x7bf09c68)
     [present .. world ..] stage table 0x72e73a29: 3 stages: 0x489b8c77 0x33824f3b 0x7bf09c68 (items 0,24,16)
 
-`checkpoint #<n>` jumps to the n-th stage of the table that registered last (the same jump as with the hash; the same
-limits).
+`checkpoint #<n>` counts in this table only when the stage list is not found (the reply says which one it counted
+in).
 
-**The table is not the whole mission.** In the Chapter 1 opening the title registers the stages as the mission
-reaches them, not all at its start: two at the start (ch1-s1, ch1-s2), one more on entering ch1-s3 (ch1-s2 is
-registered again then), the next on entering ch1-s4. So the table lists the stages registered so far, and a tester
-cannot read the later stages from it before they were reached. Reaching a stage once, or jumping to it by hash,
-adds it. Other notes:
+The table is not the whole mission. In the Chapter 1 opening the title registers the stages as the mission reaches
+them: two at the start (ch1-s1, ch1-s2), one more on entering ch1-s3 (ch1-s2 is registered again then), the next on
+entering ch1-s4. Other notes:
 
-- A stage can be registered and never be written to the stage field (see `0x4bb7a448` above): the table is not a
-  list of checkpoints. "Jump tested" is shown only for the Chapter 1 ten and only where a jump was run.
 - "Items" counts the distinct keys the title asked for under the stage so far; what they are is not known. It grows
   while the stage plays (ch1-s4: 4 on entering, 28 after the retry). Take it as a size hint only.
 - `registered 2x`: registered again, after a retry or on entering the next stage.
@@ -176,6 +226,26 @@ Then a hand-played session on the RTX 5090 (same build, `VICTORY_DT_MAX=0.2`):
 | start of the mission (ch1-s1) | `0x27788afc` | retry 14 s after the teleport at `0x27788afc` |
 | `0x27788afc` | `0x33202f8f` (back) | retry 21 s after the teleport; the weapon picked up later stayed |
 | prison cell (another mission) | `0x27788afc` | refused: no stage field found, nothing written |
+
+## Tested, stage list (v0.2.1)
+
+Four runs, RTX 5090 (octo chose to watch), Linux, Proton 11, copies of saves, Enter held through cutscenes. The last
+two used builds made with `build.sh` from a clean clone of the kit, on earlier states of patch 0014 (it changed after
+them only in the text of the fallback reply and in the "jump tested" mark for #14). No crash, no unhandled
+exception.
+
+| save | what | result |
+|---|---|---|
+| start of Chapter 1 | `stages` right after the mission start (2 stages registered) | 24 stages in play order, the same 24 as found by hand in memory before (2 runs; the first run's search found the same array). The array and its list object sat at the same addresses in all three runs |
+| start of Chapter 1 | `stages` at ch1-s3 (4 registered) and after a jump's retry | the same 24 (2 runs each; after a retry the list object is a new one) |
+| start of Chapter 1 | `checkpoint #13` from ch1-s3 | resolved to `0x835ea26a`; the title retried 26 s after the teleport at it. Then at -3489 -4547, clock 16:00 |
+| start of Chapter 1 | `checkpoint #14` from ch1-s3 (never jumped to before) | resolved to `0x210e0f0b`; retry 17 s after the teleport at it. Then at -3496 -4582, clock 16:59 |
+| prologue (the cell mission) | `stages` (2 registered), and 120 s later | 12 stages; the two registered ones (`0x08f2445f`, `0x2ed3a984`) are #2 and #3. #1 is `0xc4c1cba4`, the same first stage as in Chapter 1 |
+| prologue (the cell mission) | `stages 0x36e7f7bd` (a helper, 6 registered) | no list found; the registration table was used, as designed |
+| start of Chapter 1 | first version of the search (one run, before the list-object rule) | found the list and our own search buffer (an array of the very pointers looked for), and refused as ambiguous. That led to the two rules: a list object with the right count, and our buffers left out |
+
+Search time per `stages`: 6.6 to 10.4 s (8 measures); `checkpoint #<n>`: 9.2 and 9.6 s. Earlier, by hand (RTX 5070
+Ti, by hash): jumps to #13 and to #24 (`0xc10ae147`, with `force`) worked.
 
 ## Tested, stage table (v0.2.1)
 

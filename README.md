@@ -7,7 +7,7 @@ time of day or a cutscene without playing there. Tested on Linux under Proton wi
 RTX 5070 Ti), with the title's Xbox Series X build **1.0.2.1** on the Series X profile. It is not a script hook or a
 mod API: nothing is loaded into the game's scripts, and no command works on another build of the title.
 
-Source only: a pinned [inkVI](https://github.com/OctoAlgo/inkVI) version (v0.2.1), thirteen patches on top of it, a build
+Source only: a pinned [inkVI](https://github.com/OctoAlgo/inkVI) version (v0.2.1), fourteen patches on top of it, a build
 script, a few small scripts and this README. Every tool is in the **diagnostics build** only and stays off unless its
 switch is set. GPL-3.0, like inkVI and victory-fork.
 
@@ -20,6 +20,7 @@ switch is set. GPL-3.0, like inkVI and victory-fork.
 | 0007 | The two hook sites found by byte pattern (each must occur exactly once in the executable's code), not by fixed address. | - |
 | 0012 | `checkpoint`: jump to a stage (checkpoint) of the running mission, and a log line for every stage the title announces. Chapter 1 stages only so far; see [docs/checkpoints.md](docs/checkpoints.md). | `VICTORY_NATIVES=1` |
 | 0013 | The stage table: the stages a mission registers at its start, in order, with item counts; `checkpoint list` prints the running mission's table, the channel logs it, and `checkpoint #<n>` jumps to its n-th stage. See [docs/checkpoints.md](docs/checkpoints.md). | `VICTORY_NATIVES=1` |
+| 0014 | The stage list: `stages` reads the running mission's full stage list from memory, in play order, with no stage hash known in advance; `checkpoint #<n>` counts in it (the table of 0013 is the fallback). `memfind` / `memdump` for mining such structures. See [docs/checkpoints.md](docs/checkpoints.md), "Stage list". | `VICTORY_NATIVES=1` |
 | 0008-0011 | Captures for testing pictures: full-size frames, raw rows, a wall-clock window, a window after every start of a chosen cutscene, `cap [<n>]` from the channel, and captures when no swap chain can be made (headless second cards). | `VICTORY_CAPTURE_*` (below) |
 
 `patches/README.md` lists every patch with its files and licence.
@@ -80,6 +81,8 @@ Checked in the game (build 1.0.2.1, Series X profile). The last line of each rep
 | `cap [<n>]` | save the next n frames (needs `VICTORY_CAPTURE`) | `cap: presents 1873..1874 are saved` |
 | `ncall <NAME\|0x<hash>\|+0x<rva>\|m+0x<rva>> [ret=<n>] [><var>] [wait=<secs>] [<arg>...]` | any native or script-class method | `#310 SET_CLOCK_TIME ... 9 15 30 -> ret [0x0]` |
 | `checkpoint list` / `checkpoint <stage or #n>` | the known mission stages, the running mission's stage table and the current stage / jump to a stage of the running mission (see Checkpoints) | `checkpoint done: the title retried the mission 21 s after the teleport at ch1-s2 (0x33824f3b) ...` |
+| `stages [0x<script>]` | the running mission's full stage list from memory, in play order, numbered for `checkpoint #<n>` (the game stands still 6-10 s while it searches) | `stage list of script 0x72e73a29 (registered last): 24 stages in play order, read from memory: ...` |
+| `memfind <u32>...` / `memdump <addr> <len>` | every place a 4-byte value occurs in writable memory (to `find.txt`) / raw bytes to `dump-<addr>.bin` | `memfind: 12889 MB scanned, hits in ...\find.txt` |
 | `nstat`, `nfind`, `nscript`, `ntrace`, `nmark`, `nwatch`, `ndump`, `nlog`, `nhelp` | the hook's state, which script runs queued calls, traces | |
 | `peek`, `peekf`, `poke`, `pokef`, `base`, `help` | raw memory (no natives needed) | |
 
@@ -107,13 +110,15 @@ Finding the natives behind something new: run with `log`, do the thing, `nlog`, 
 A test tool for reaching a mission stage quickly: `checkpoint <stage>` writes the stage into the field where the title
 keeps the running mission's current stage, makes the mission fail once with a far teleport, and lets the title's own
 retry restart the mission at that stage, with its own scenes, clock and placement. Backward and forward jumps work in
-the Chapter 1 opening, also straight from the start of the mission (ten stages known so far: `ch1-s1` .. `ch1-s4`
-and six more by hash); nothing else is shown yet.
+the Chapter 1 opening, also straight from the start of the mission. `stages` reads the running mission's full stage
+list from memory (24 stages in the Chapter 1 opening), so you can jump by number without knowing any hash.
 
-    DWAIT=300 tools/dcmd.sh <channel> "checkpoint list"
+    DWAIT=60 tools/dcmd.sh <channel> stages
+    DWAIT=300 tools/dcmd.sh <channel> "checkpoint #13"
     DWAIT=300 tools/dcmd.sh <channel> "checkpoint ch1-s2"
 
-Limits, up front: Chapter 1 stages only; a mission must be running (one that fails by distance); the jump fails the
+Limits, up front: jumps in Chapter 1 only (the list reads in the cell mission too, the jump does not); a stage in
+the list is not always a checkpoint; `stages` stops the game for 6-10 s while it searches; a mission must be running (one that fails by distance); the jump fails the
 mission on purpose; passing a mission, free roam and later chapters are not shown; a forward jump skips whatever the
 skipped stages would have set, so never keep playing on that save; the field's address differs by build (it is found
 fresh every time, and the command refuses if it does not find exactly one); the far teleport it uses crashed the
@@ -241,7 +246,7 @@ them: a `tp` streams the area in and holds the player until the ground is there.
   the game inside the title's own teleport: wait until the mission runs again (`pos` shows the clock moving). Far
   teleports outside missions are untested (we have no free-roam save yet). `checkpoint` keeps to this: it refuses
   while the clock stands still and for 60 s after a retry, and never teleports after the retry it caused.
-- **Checkpoints:** Chapter 1 stages only, and the jump fails the mission on purpose (docs/checkpoints.md).
+- **Checkpoints:** jumps in Chapter 1 only, and the jump fails the mission on purpose (docs/checkpoints.md).
 - **One crash cause to avoid:** never call `SCENE_ON_EVENT` (`m+0x4bfdb10` / `m+0x4bfdbb0`) by hand. Its second
   argument is a script function; anything else is called as one when the event fires and the game faults.
 - `ncall` with a wrong argument count or a made-up pointer can crash the game, and `m+0x<rva>` with a wrong address
@@ -268,7 +273,7 @@ stages of more missions.
 
 ## What this kit ships, and what it does not
 
-Ships: thirteen patches (all our own, GPL-3.0), a build script, `tools/` (`dcmd.sh`, the trace readers `ntrace.py` and
+Ships: fourteen patches (all our own, GPL-3.0), a build script, `tools/` (`dcmd.sh`, the trace readers `ntrace.py` and
 `nlogx.py`, `capture-receipt.py` and its test, `natives-names.txt`, `bookmarks.example.txt`), this README, `docs/`, a
 changelog and the licence.
 Does not ship: any binary, the title or any of its files, inkVI's or victory-fork's code (fetched at pinned commits by

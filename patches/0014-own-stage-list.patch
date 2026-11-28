@@ -1,4 +1,4 @@
-From 3c81d1da77f6b98d93a2e396ff89e4d58d760ce9 Mon Sep 17 00:00:00 2001
+From bddf48296c756b23aa6277aa8f904d0370a7b81f Mon Sep 17 00:00:00 2001
 From: Octo <180629317+OctoAlgo@users.noreply.github.com>
 Date: Sat, 28 Nov 2026 14:36:34 +0100
 Subject: [PATCH] stages: the running mission's full stage list, read from
@@ -185,7 +185,7 @@ index 6766b7a..5f91919 100644
  mod copystat;
 diff --git a/crates/victory-gpu/src/stagelist.rs b/crates/victory-gpu/src/stagelist.rs
 new file mode 100644
-index 0000000..d28c38c
+index 0000000..14fa6d6
 --- /dev/null
 +++ b/crates/victory-gpu/src/stagelist.rs
 @@ -0,0 +1,484 @@
@@ -456,7 +456,7 @@ index 0000000..d28c38c
 +}
 +
 +/// Jumps tested to stages that are not among the Chapter 1 ten of `checkpoint::TEN` (found by this list).
-+const TESTED_MORE: [u32; 2] = [0x835e_a26a, 0xc10a_e147];
++const TESTED_MORE: [u32; 3] = [0x835e_a26a, 0x210e_0f0b, 0xc10a_e147];
 +
 +fn tested(h: u32) -> bool {
 +    crate::checkpoint::TEN.iter().any(|k| k.0 == h && k.1) || TESTED_MORE.contains(&h)

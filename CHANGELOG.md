@@ -1,17 +1,29 @@
 # Changelog
 
-## v0.2.1 - the stage table (on inkVI v0.2.1, thirteen patches)
+## v0.2.1 - the stage list (on inkVI v0.2.1, fourteen patches)
 
+- Patch 0014: `stages` reads the running mission's full stage list from the title's memory, in play order. No
+  stage hash has to be known: the stages the mission registered so far are the anchors. It uses a list only when
+  it finds exactly one, else it says what it found. `checkpoint #<n>` counts in this list; the table of patch 0013
+  is the fallback. `memfind` and `memdump`, the raw commands the list was found with, stay. docs/checkpoints.md,
+  "Stage list".
 - Patch 0013: the hook records the stages a mission registers at its start (`MISSION_STAGE_ADD`), in registration
   order, with a count of items per stage (`MISSION_STAGE_ITEM`). One line per stage and a summary line go to the
   channel's `log.txt` and the game log. `checkpoint list` prints the running mission's table. `checkpoint #<n>` jumps
   to the n-th stage of the table. The jump itself is unchanged. docs/checkpoints.md, "Stage table".
 - Names file: `MISSION_STAGE_ADD`, `MISSION_STAGE_ITEM`.
 
-Checked: three scripted runs on the RTX 5070 Ti (Linux, Proton 11, Series X profile, copies of saves, no picture):
-two from the start of Chapter 1 (table built as the stages are reached; `checkpoint #4` from ch1-s3 lands on ch1-s4
-both times) and one in the prologue (the cell mission: four registering scripts). Not run on the RTX 5090 for this
-version. docs/checkpoints.md, "Tested, stage table".
+Checked, stage list: four scripted runs on the RTX 5090 (Linux, Proton 11, Series X profile, copies of saves), two
+of them on builds made with `build.sh` from a clean clone. Chapter 1: right after the mission start (2 stages
+registered) `stages` lists 24 stages, the same 24 found by hand before; `checkpoint #13` and `checkpoint #14` from
+ch1-s3 land there (retry 26 s and 17 s after the teleport). The cell mission: 12 stages, the two registered ones
+among them. One search takes 6.6 to 10.4 s, and the game stands still meanwhile. docs/checkpoints.md, "Tested, stage
+list".
+
+Checked, stage table: three scripted runs on the RTX 5070 Ti (Linux, Proton 11, Series X profile, copies of saves,
+no picture): two from the start of Chapter 1 (table built as the stages are reached; `checkpoint #4` from ch1-s3
+lands on ch1-s4 both times) and one in the prologue (the cell mission: four registering scripts).
+docs/checkpoints.md, "Tested, stage table".
 
 ## v0.2 - checkpoints (on inkVI v0.2.1, twelve patches)
 

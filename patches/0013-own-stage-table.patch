@@ -1,0 +1,381 @@
+From 7ef1156e5cdf9c5c1a0f824719eefc9f1a12df18 Mon Sep 17 00:00:00 2001
+From: Octo <180629317+OctoAlgo@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 11:51:49 +0100
+Subject: [PATCH] stage table: the stages a mission registers, in order;
+ checkpoint list prints them; checkpoint #<n>
+
+The title registers each stage of a mission through one native (MISSION_STAGE_ADD) and asks for the
+items of a stage through another (MISSION_STAGE_ITEM). The hook records, per mission (the registering
+script), the stages in registration order with a count of items and registrations. The channel logs
+one line per stage and a summary when the registrations pause. `checkpoint list` prints the running
+mission's table; `checkpoint #<n>` jumps to its n-th stage. The jump itself is unchanged.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Kit-Source: own (inkVI-dive, checkpoints)
+Kit-Licence: GPL-3.0
+---
+ crates/victory-gpu/src/checkpoint.rs |  98 ++++++++++++++++++-
+ crates/victory-gpu/src/debugcmd.rs   |   5 +
+ crates/victory-loader/src/natives.rs | 137 ++++++++++++++++++++++++++-
+ 3 files changed, 235 insertions(+), 5 deletions(-)
+
+diff --git a/crates/victory-gpu/src/checkpoint.rs b/crates/victory-gpu/src/checkpoint.rs
+index 5eaa3a5..d40aca0 100644
+--- a/crates/victory-gpu/src/checkpoint.rs
++++ b/crates/victory-gpu/src/checkpoint.rs
+@@ -27,6 +27,7 @@
+ //! stage loading), and none after the retry.
+ 
+ use crate::debugcmd::Memory;
++use victory_loader::natives;
+ 
+ /// A stage of a mission we know.
+ #[derive(Clone, Copy, Debug, PartialEq)]
+@@ -46,6 +47,21 @@ pub(crate) const KNOWN: [Stage; 4] = [
+     Stage { hash: 0x8cf1_71f3, label: "ch1-s4", what: "in the boat on the river (control returned)" },
+ ];
+ 
++/// The Chapter 1 stages known so far, in order, and whether a jump to each was tested (docs/checkpoints.md).
++/// The first four are `KNOWN`; the other six have no labels (found by playing).
++pub(crate) const TEN: [(u32, bool); 10] = [
++    (0x489b_8c77, false),
++    (0x3382_4f3b, true),
++    (0x7bf0_9c68, false),
++    (0x8cf1_71f3, true),
++    (0x3320_2f8f, true),
++    (0xfa7c_8d56, false),
++    (0x0fe6_10ad, false),
++    (0x2778_8afc, true),
++    (0xf678_7e02, false),
++    (0xd9dd_aa4f, false),
++];
++
+ pub(crate) fn label(hash: u32) -> Option<&'static str> {
+     KNOWN.iter().find(|s| s.hash == hash).map(|s| s.label)
+ }
+@@ -218,7 +234,7 @@ pub(crate) fn parse_ask(args: &[&str]) -> Result<Ask, String> {
+     Ok(ask)
+ }
+ 
+-pub(crate) const USAGE: &str = "checkpoint list | checkpoint <stage: ch1-s1..ch1-s4 or 0x<hash>> [dist=<m>] [wait=<s>] [slot=<addr>] [force]";
++pub(crate) const USAGE: &str = "checkpoint list | checkpoint <stage: ch1-s1..ch1-s4, 0x<hash> or #<n> of the table> [dist=<m>] [wait=<s>] [slot=<addr>] [force]";
+ 
+ /// The text of `checkpoint list`: the known stages, the stages the title announced this session that have no
+ /// label, the current stage from the field (if exactly one holder is left), the last announcement.
+@@ -251,6 +267,51 @@ pub(crate) fn list_text(seen: &[u32], keep: &[Holder], drop: &[(Holder, &str)],
+     s
+ }
+ 
++/// The text of the stage tables, one block per registering script (a mission, or a helper of it): the one that
++/// registered last comes last (`checkpoint #<n>` counts in it). Per stage: its place, the hash (and label), the
++/// items the title asked for under it, how often it was registered, and whether a jump to it was tested
++/// (only known for the Chapter 1 ten).
++pub(crate) fn table_text(tables: &[natives::StageTable], hooked: bool) -> String {
++    if tables.is_empty() {
++        return if hooked { "stage table: no mission has registered stages yet (only a mission start does, not a retry)".into() } else { "stage table: not seen: needs VICTORY_NATIVES and MISSION_STAGE_ADD in the names file".into() };
++    }
++    let mut s = String::new();
++    for (k, t) in tables.iter().enumerate() {
++        if k > 0 {
++            s.push('\n');
++        }
++        s.push_str(&format!("stage table of script {:#010x}{}: {} stages in the order the title registered them", t.mission, if k + 1 == tables.len() { " (registered last)" } else { "" }, t.stages.len()));
++        for (i, st) in t.stages.iter().enumerate() {
++            let known = TEN.iter().position(|k| k.0 == st.stage);
++            let tested = known.is_some_and(|k| TEN[k].1);
++            s.push_str(&format!(
++                "\n  #{} {}  items {}  registered {}x{}",
++                i + 1,
++                name(st.stage),
++                st.items,
++                st.regs,
++                if tested { "  jump tested" } else { "" },
++            ));
++        }
++    }
++    s
++}
++
++/// One line for the logs: a stage registered, or the table's summary.
++pub(crate) fn news_line(n: &natives::TableNews, tables: &[natives::StageTable]) -> Option<String> {
++    let m = tables.iter().find(|m| m.mission == n.mission)?;
++    Some(match n.stage {
++        Some(i) => {
++            let st = m.stages.get(i)?;
++            format!("stage table {:#010x} #{}: {}{}", m.mission, i + 1, name(st.stage), if n.again { " registered again" } else { "" })
++        }
++        None => {
++            let order: Vec<String> = m.stages.iter().map(|s| format!("{:#010x}", s.stage)).collect();
++            format!("stage table {:#010x}: {} stages: {} (items {})", m.mission, m.stages.len(), order.join(" "), m.stages.iter().map(|s| s.items.to_string()).collect::<Vec<_>>().join(","))
++        }
++    })
++}
++
+ #[cfg(windows)]
+ pub(crate) use live::{Job, list};
+ 
+@@ -259,7 +320,6 @@ mod live {
+     use super::*;
+     use std::path::{Path, PathBuf};
+     use std::time::{Duration, Instant};
+-    use victory_loader::natives;
+ 
+     /// How long the second look at the candidates waits (a stack slot changes within it, the field does not).
+     const SETTLE: Duration = Duration::from_secs(2);
+@@ -342,7 +402,8 @@ mod live {
+         let all = holders(mem, &stages);
+         let (keep, drop) = pick(&all, own_stack());
+         let field = (keep.len() == 1).then(|| keep[0].at);
+-        (list_text(&natives::stages_seen(), &keep, &drop, last_announced(), natives::stage_hooked()), field)
++        let text = list_text(&natives::stages_seen(), &keep, &drop, last_announced(), natives::stage_hooked());
++        (format!("{text}\n{}", table_text(&natives::stage_tables(), natives::table_hooked())), field)
+     }
+ 
+     fn queue(line: &str, folder: &Path) -> Result<Vec<u64>, String> {
+@@ -357,7 +418,20 @@ mod live {
+     impl Job {
+         /// Starts a jump: checks, finds the candidates, queues the first `pos`. `Err` = refused, nothing done.
+         pub(crate) fn start<M: Memory>(mem: &M, args: &[&str], folder: &Path) -> Result<(Job, String), String> {
+-            let ask = parse_ask(args)?;
++            // `#<n>`: the n-th stage of the running mission's table.
++            let nth = match args.first().and_then(|a| a.strip_prefix('#')) {
++                Some(n) => {
++                    let t = natives::stage_tables();
++                    let st = n.parse::<usize>().ok().filter(|n| *n > 0).and_then(|n| t.last()?.stages.get(n - 1).cloned());
++                    Some(format!("{:#010x}", st.ok_or_else(|| format!("no stage {} in the table (checkpoint list)", args[0]))?.stage))
++                }
++                None => None,
++            };
++            let mut args = args.to_vec();
++            if let Some(h) = nth.as_deref() {
++                args[0] = h;
++            }
++            let ask = parse_ask(&args)?;
+             if !natives::stage_hooked() {
+                 return Err("needs VICTORY_NATIVES=1 and the name MISSION_STAGE_SET in the names file (the retry is seen through it)".into());
+             }
+@@ -690,6 +764,22 @@ mod tests {
+         assert!(lines.contains("0x10568 = ch1-s3 (0x7bf09c68) next 0x1: candidate") && lines.contains("... 3 more"), "{lines}");
+     }
+ 
++    #[test]
++    fn stage_table_text() {
++        assert!(table_text(&[], true).contains("no mission has registered"));
++        assert!(table_text(&[], false).contains("MISSION_STAGE_ADD"));
++        let t = natives::StageTable::for_test(0x72e7_3a29, &[(0x489b_8c77, 3, 1), (0x3382_4f3b, 0, 2), (0x0bad_cafe, 0, 1)]);
++        let text = table_text(&[t.clone()], true);
++        assert!(text.contains("script 0x72e73a29 (registered last): 3 stages"), "{text}");
++        assert!(text.contains("#1 ch1-s1 (0x489b8c77)  items 3  registered 1x\n"), "{text}");
++        assert!(text.contains("#2 ch1-s2 (0x33824f3b)  items 0  registered 2x  jump tested\n"), "{text}");
++        assert!(text.contains("#3 0x0badcafe (no label)  items 0  registered 1x"), "{text}");
++        let sum = news_line(&natives::TableNews { mission: 0x72e7_3a29, stage: None, again: false }, &[t.clone()]).unwrap();
++        assert!(sum.contains("3 stages: 0x489b8c77 0x33824f3b 0x0badcafe (items 3,0,0)"), "{sum}");
++        let one = news_line(&natives::TableNews { mission: 0x72e7_3a29, stage: Some(1), again: true }, &[t]).unwrap();
++        assert!(one.contains("#2: ch1-s2 (0x33824f3b) registered again"), "{one}");
++    }
++
+     #[test]
+     fn position_and_clock() {
+         let t = "#5 GET_CLOCK_SECONDS -> ret [0x4]\npos -2068.100 -4375.200 1.500 heading 90.00 time 14:38:04";
+diff --git a/crates/victory-gpu/src/debugcmd.rs b/crates/victory-gpu/src/debugcmd.rs
+index 57bf664..bd48e85 100644
+--- a/crates/victory-gpu/src/debugcmd.rs
++++ b/crates/victory-gpu/src/debugcmd.rs
+@@ -806,6 +806,11 @@ pub(crate) fn present(frame: u64) {
+             stage_lines.push(format!("stage {}{} (announced by script {:#x})", crate::checkpoint::name(e.stage), if e.restart != 0 { " RETRY" } else { "" }, e.script));
+         }
+     }
++    let news = victory_loader::natives::table_news(std::time::Duration::from_secs(3));
++    if !news.is_empty() {
++        let tables = victory_loader::natives::stage_tables();
++        stage_lines.extend(news.iter().filter_map(|n| crate::checkpoint::news_line(n, &tables)));
++    }
+     if let Some((at, last)) = ch.field.filter(|_| frame.is_multiple_of(4)) {
+         // Only stages are logged: while the title restarts a mission the field passes through other values.
+         let now = ch.exec.mem.read(at, 8).map(|b| u64::from_le_bytes(b[..8].try_into().unwrap_or_default()));
+diff --git a/crates/victory-loader/src/natives.rs b/crates/victory-loader/src/natives.rs
+index 05af2d4..1334107 100644
+--- a/crates/victory-loader/src/natives.rs
++++ b/crates/victory-loader/src/natives.rs
+@@ -19,7 +19,7 @@
+ //! the native the script asked for. `VICTORY_NATIVES=trace` also records,
+ //! per native, how often it is called and its first calls' arguments.
+ 
+-use std::collections::{HashMap, VecDeque};
++use std::collections::{HashMap, HashSet, VecDeque};
+ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Mutex, MutexGuard, OnceLock};
+ use std::time::{Duration, Instant};
+@@ -358,6 +358,10 @@ struct State {
+     /// LOCAL (octo, inkVI-dive): the native through which the title announces a mission's stage (the name
+     /// `MISSION_STAGE_SET`: (stage hash, restart flag)), 0 if not named: its calls fill `STAGES` (`checkpoint`).
+     stage_rva: usize,
++    /// LOCAL (octo, inkVI-dive): the natives a mission registers its stages with (`MISSION_STAGE_ADD`: (stage)) and
++    /// the items of a stage with (`MISSION_STAGE_ITEM`: (stage << 32 | item)), 0 if not named: they fill `TABLES`.
++    add_rva: usize,
++    item_rva: usize,
+     scenes: Mutex<Vec<Scene>>,
+     started: Instant,
+     queue: Mutex<Queue>,
+@@ -558,6 +562,8 @@ pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
+     let create_rva = names.get("SCENE_CREATE").and_then(|h| by_hash.get(h)).copied().unwrap_or(0);
+     let state_start_rva = methods.get("SCENE_START").copied().unwrap_or(0);
+     let stage_rva = names.get("MISSION_STAGE_SET").and_then(|h| by_hash.get(h)).copied().unwrap_or(0);
++    let add_rva = names.get("MISSION_STAGE_ADD").and_then(|h| by_hash.get(h)).copied().unwrap_or(0);
++    let item_rva = names.get("MISSION_STAGE_ITEM").and_then(|h| by_hash.get(h)).copied().unwrap_or(0);
+     let state = State {
+         base,
+         size,
+@@ -568,6 +574,8 @@ pub(crate) unsafe fn install(base: usize, size: usize, hash: &blake3::Hash) {
+         create_rva,
+         start_rva: state_start_rva,
+         stage_rva,
++        add_rva,
++        item_rva,
+         scenes: Mutex::new(Vec::new()),
+         started: Instant::now(),
+         queue: Mutex::new(Queue { next_id: 1, ..Queue::default() }),
+@@ -759,6 +767,115 @@ pub fn stage_hooked() -> bool {
+     STATE.get().is_some_and(|st| st.stage_rva != 0)
+ }
+ 
++/// LOCAL (octo, inkVI-dive): a stage a mission registered.
++#[derive(Clone, Debug, PartialEq)]
++pub struct TableStage {
++    pub stage: u32,
++    /// How many items (distinct `MISSION_STAGE_ITEM` keys) the title asked for under this stage.
++    pub items: u32,
++    /// How many times the stage was registered (more than once after a retry or a restart).
++    pub regs: u32,
++}
++
++/// The stages one mission (its script hash) registered, in order of first registration.
++#[derive(Clone, Debug, PartialEq)]
++pub struct StageTable {
++    pub mission: u32,
++    pub stages: Vec<TableStage>,
++    keys: HashSet<u64>,
++}
++
++/// What the channel should log: a stage registered (`stage` = its index in the table, `again` = not the first time),
++/// or the table's summary (`stage` None) once the registrations paused.
++#[derive(Clone, Debug, PartialEq)]
++pub struct TableNews {
++    pub mission: u32,
++    pub stage: Option<usize>,
++    pub again: bool,
++}
++
++impl StageTable {
++    /// A table for tests: (stage, items, registrations).
++    pub fn for_test(mission: u32, stages: &[(u32, u32, u32)]) -> Self {
++        let stages = stages.iter().map(|&(stage, items, regs)| TableStage { stage, items, regs }).collect();
++        StageTable { mission, stages, keys: HashSet::new() }
++    }
++}
++
++#[derive(Default)]
++struct Tables {
++    /// In order of first registration; the last one is the mission that registered last.
++    all: Vec<StageTable>,
++    news: Vec<TableNews>,
++    last: Option<Instant>,
++    summarised: bool,
++}
++static TABLES: Mutex<Tables> = Mutex::new(Tables { all: Vec::new(), news: Vec::new(), last: None, summarised: true });
++const TABLES_MAX: usize = 64;
++const KEYS_MAX: usize = 1 << 16;
++
++#[cfg(windows)]
++fn note_table_stage(arg: u64, mission: u32) {
++    let (stage, mut t) = (arg as u32, lock(&TABLES));
++    let at = match t.all.iter().position(|m| m.mission == mission) {
++        Some(i) => i,
++        None if t.all.len() < TABLES_MAX => {
++            t.all.push(StageTable { mission, stages: Vec::new(), keys: HashSet::new() });
++            t.all.len() - 1
++        }
++        None => return,
++    };
++    let last = t.all.len() - 1;
++    t.all.swap(at, last); // the mission that registers is the running one
++    let (idx, again) = match t.all[last].stages.iter().position(|s| s.stage == stage) {
++        Some(i) => {
++            t.all[last].stages[i].regs += 1;
++            (i, true)
++        }
++        None => {
++            t.all[last].stages.push(TableStage { stage, items: 0, regs: 1 });
++            (t.all[last].stages.len() - 1, false)
++        }
++    };
++    t.news.push(TableNews { mission, stage: Some(idx), again });
++    t.last = Some(Instant::now());
++    t.summarised = false;
++}
++
++#[cfg(windows)]
++fn note_table_item(key: u64, mission: u32) {
++    let mut t = lock(&TABLES);
++    let Some(m) = t.all.iter_mut().find(|m| m.mission == mission) else { return };
++    if m.keys.len() < KEYS_MAX && m.keys.insert(key) {
++        if let Some(s) = m.stages.iter_mut().find(|s| s.stage == (key >> 32) as u32) {
++            s.items += 1;
++        }
++    }
++}
++
++/// The stage tables so far (the running mission's is the last).
++pub fn stage_tables() -> Vec<StageTable> {
++    lock(&TABLES).all.clone()
++}
++
++/// Whether stages are seen being registered (the hook is on and `MISSION_STAGE_ADD` is named).
++pub fn table_hooked() -> bool {
++    STATE.get().is_some_and(|st| st.add_rva != 0)
++}
++
++/// The news since the last call; the summary comes once no stage was registered for `quiet`.
++pub fn table_news(quiet: std::time::Duration) -> Vec<TableNews> {
++    let mut t = lock(&TABLES);
++    let mut news = std::mem::take(&mut t.news);
++    if !t.summarised && t.last.is_some_and(|l| l.elapsed() >= quiet) {
++        t.summarised = true;
++        if let Some(m) = t.all.last() {
++            news.push(TableNews { mission: m.mission, stage: None, again: false });
++        }
++    }
++    news
++}
++
+ /// Seconds since the scene named `name` was last started, if it was.
+ pub fn since_scene_start(name: u32) -> Option<f64> {
+     lock(&STARTS).iter().find(|(n, _)| *n == name).map(|(_, at)| at.elapsed().as_secs_f64())
+@@ -840,6 +957,24 @@ unsafe extern "win64" fn dispatch(ctx: *mut Ctx, handler: usize, sctx: usize, by
+             }
+         }
+     }
++    if st.add_rva != 0 && handler.wrapping_sub(st.base) == st.add_rva {
++        // SAFETY: the context the interpreter just built: (stage), read before the call.
++        unsafe {
++            let c = &*ctx;
++            if c.argc >= 1 && !c.args.is_null() {
++                note_table_stage(c.args.read_unaligned(), script_id(sctx));
++            }
++        }
++    }
++    if st.item_rva != 0 && handler.wrapping_sub(st.base) == st.item_rva {
++        // SAFETY: the same.
++        unsafe {
++            let c = &*ctx;
++            if c.argc >= 1 && !c.args.is_null() {
++                note_table_item(c.args.read_unaligned(), script_id(sctx));
++            }
++        }
++    }
+     let mut sampled = None;
+     if TRACING.load(Ordering::Relaxed) {
+         // SAFETY: the context the interpreter just built.
+-- 
+2.56.0
+

@@ -41,3 +41,7 @@ GET_CAM_COORD 0x13d4be90acad1fda
 # Mission stages (checkpoints): the title announces each stage of the running mission through this native, as
 # (stage hash, restart flag); restart 1 = the retry after a fail restarts the mission at that stage. Needed by `checkpoint`.
 MISSION_STAGE_SET 0x9e1672bf38ba217a
+# The stage table (patch 0013): a mission registers each of its stages at its start with MISSION_STAGE_ADD (stage, 0)
+# and asks for the items of a stage with MISSION_STAGE_ITEM (stage << 32 | item). `checkpoint list` prints the table.
+MISSION_STAGE_ADD 0x75549f1970ac6acd
+MISSION_STAGE_ITEM 0x56681708268ee031

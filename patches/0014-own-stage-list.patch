@@ -1,0 +1,678 @@
+From 3c81d1da77f6b98d93a2e396ff89e4d58d760ce9 Mon Sep 17 00:00:00 2001
+From: Octo <180629317+OctoAlgo@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 14:36:34 +0100
+Subject: [PATCH] stages: the running mission's full stage list, read from
+ memory; checkpoint #<n> counts in it
+
+The title keeps a mission's stages as 32-byte heap objects {type, stage hash, 0, pointer, 0} and the
+mission's stage list as a list object {type, data, count, capacity} whose data is an array of
+pointers to those objects, in play order. No stage hash is known in advance: the stages the mission
+has registered so far (patch 0013's table) are the anchors. Their objects are found by shape, then
+every array of pointers to objects of the same type holding them, then each array's list object.
+Exactly one list (by content) whose list object's count is the array's length, with the anchors in
+registration order, must be found, or none is used. Our own search buffers are left out.
+
+`stages [0x<script>]` prints the list with #numbers and marks the stages registered, announced and
+jump tested. `checkpoint #<n>` counts in the full list and falls back to the registration table
+when the list is not found. `memfind` / `memdump` stay as diagnostic commands for mining such
+structures.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Kit-Source: own (inkVI-dive, checkpoints)
+Kit-Licence: GPL-3.0
+---
+ crates/victory-gpu/src/checkpoint.rs |  19 +-
+ crates/victory-gpu/src/debugcmd.rs   |  69 ++++
+ crates/victory-gpu/src/lib.rs        |   3 +
+ crates/victory-gpu/src/stagelist.rs  | 484 +++++++++++++++++++++++++++
+ 4 files changed, 565 insertions(+), 10 deletions(-)
+ create mode 100644 crates/victory-gpu/src/stagelist.rs
+
+diff --git a/crates/victory-gpu/src/checkpoint.rs b/crates/victory-gpu/src/checkpoint.rs
+index d40aca0..ae9256e 100644
+--- a/crates/victory-gpu/src/checkpoint.rs
++++ b/crates/victory-gpu/src/checkpoint.rs
+@@ -234,7 +234,7 @@ pub(crate) fn parse_ask(args: &[&str]) -> Result<Ask, String> {
+     Ok(ask)
+ }
+ 
+-pub(crate) const USAGE: &str = "checkpoint list | checkpoint <stage: ch1-s1..ch1-s4, 0x<hash> or #<n> of the table> [dist=<m>] [wait=<s>] [slot=<addr>] [force]";
++pub(crate) const USAGE: &str = "checkpoint list | checkpoint <stage: ch1-s1..ch1-s4, 0x<hash> or #<n> of the stage list> [dist=<m>] [wait=<s>] [slot=<addr>] [force]";
+ 
+ /// The text of `checkpoint list`: the known stages, the stages the title announced this session that have no
+ /// label, the current stage from the field (if exactly one holder is left), the last announcement.
+@@ -418,17 +418,15 @@ mod live {
+     impl Job {
+         /// Starts a jump: checks, finds the candidates, queues the first `pos`. `Err` = refused, nothing done.
+         pub(crate) fn start<M: Memory>(mem: &M, args: &[&str], folder: &Path) -> Result<(Job, String), String> {
+-            // `#<n>`: the n-th stage of the running mission's table.
+-            let nth = match args.first().and_then(|a| a.strip_prefix('#')) {
+-                Some(n) => {
+-                    let t = natives::stage_tables();
+-                    let st = n.parse::<usize>().ok().filter(|n| *n > 0).and_then(|n| t.last()?.stages.get(n - 1).cloned());
+-                    Some(format!("{:#010x}", st.ok_or_else(|| format!("no stage {} in the table (checkpoint list)", args[0]))?.stage))
+-                }
++            // `#<n>`: the n-th stage of the running mission's full stage list (crate::stagelist), or of its
++            // registration table when the list is not found.
++            let nth = match args.first().filter(|a| a.starts_with('#')) {
++                Some(w) => Some(crate::stagelist::nth(mem, w)?),
+                 None => None,
+             };
++            let hash = nth.as_ref().map(|(h, _)| format!("{h:#010x}"));
+             let mut args = args.to_vec();
+-            if let Some(h) = nth.as_deref() {
++            if let Some(h) = hash.as_deref() {
+                 args[0] = h;
+             }
+             let ask = parse_ask(&args)?;
+@@ -479,7 +477,8 @@ mod live {
+                 lines: Vec::new(),
+                 results: Vec::new(),
+             };
+-            Ok((job, format!("checkpoint -> {}: {found}", name(ask.target))))
++            let counted = nth.map_or(String::new(), |(_, from)| format!(" ({from})"));
++            Ok((job, format!("checkpoint -> {}{counted}: {found}", name(ask.target))))
+         }
+ 
+         /// Collects the results of queued calls; `Some(last text)` when all are back.
+diff --git a/crates/victory-gpu/src/debugcmd.rs b/crates/victory-gpu/src/debugcmd.rs
+index bd48e85..c41a87d 100644
+--- a/crates/victory-gpu/src/debugcmd.rs
++++ b/crates/victory-gpu/src/debugcmd.rs
+@@ -385,6 +385,7 @@ impl<M: Memory> Executor<M> {
+                 scan [<zmin> <zmax>] | findptr <lo> <hi> | chain <addr> [<off>...] | matrix <off>... | pos | \
+                 tp <x> <y> <z> [<heading>] | time <hh> <mm> | save <name> | goto <name> | marks | settings | \
+                 checkpoint list | checkpoint <stage> [dist=<m>] [wait=<s>] [slot=<addr>] [force] (jump to a stage of the running mission) | \
++                stages [0x<script>] (the running mission's full stage list) | memfind <u32>... | memdump <addr> <len> | \
+                 nhelp (script natives: ncall, pos, tp, time, date, tpsave, tpgo, tpmarks, scene, nstat, ntrace, ndump, nlog, nmark, nwatch, nscript, nfind)"
+                 .into()),
+             "base" => {
+@@ -526,6 +527,67 @@ impl<M: Memory> Executor<M> {
+                 self.last_scan = hits;
+                 Ok(s)
+             }
++            // LOCAL (octo, inkVI-dive, for mining structures such as the stage list): `memfind <u32>...` finds
++            // each 4-byte value (little-endian, any byte offset) in writable memory, image included; every hit
++            // (at most 2000 per value) with 64 bytes around it goes to <folder>\find.txt. Our own buffers show up
++            // too (the needle list). `memdump <addr> <len>` saves raw bytes to <folder>\dump-<addr>.bin (at most
++            // 256 MB).
++            "memfind" => {
++                let needles: Vec<u32> = args.iter().filter_map(|w| parse_addr(w, 0).map(|v| v as u32)).collect();
++                if needles.is_empty() {
++                    return Err("memfind <u32> [<u32>...]".into());
++                }
++                let mut first = [false; 256];
++                for n in &needles {
++                    first[(n & 0xff) as usize] = true;
++                }
++                let mut text = String::new();
++                let mut count = vec![0usize; needles.len()];
++                let mut bytes = 0usize;
++                for r in self.mem.regions() {
++                    let end = r.base + r.size;
++                    let mut at = r.base;
++                    while at < end {
++                        let len = (end - at).min(64 << 20);
++                        let take = (len + 3).min(end - at);
++                        if let Some(b) = self.mem.read(at, take) {
++                            bytes += len;
++                            for i in 0..len.min(b.len().saturating_sub(3)) {
++                                if !first[b[i] as usize] {
++                                    continue;
++                                }
++                                let v = u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
++                                if let Some(k) = needles.iter().position(|n| *n == v) {
++                                    count[k] += 1;
++                                    if count[k] <= 2000 {
++                                        let a = at + i;
++                                        let ctx = self.mem.read(a.saturating_sub(64), 132).unwrap_or_default();
++                                        let hex: String = ctx.iter().map(|c| format!("{c:02x}")).collect();
++                                        let _ = writeln!(text, "{v:#010x} {a:#x} img={} ctx-64 {hex}", r.image);
++                                    }
++                                }
++                            }
++                        }
++                        at += len;
++                    }
++                }
++                let file = self.scan_file.with_file_name("find.txt");
++                let _ = std::fs::write(&file, text);
++                let mut s = format!("memfind: {} MB scanned, hits in {}", bytes >> 20, file.display());
++                for (n, c) in needles.iter().zip(&count) {
++                    let _ = write!(s, "\n  {n:#010x}: {c}");
++                }
++                Ok(s)
++            }
++            "memdump" => {
++                let addr = self.addr(args.first().ok_or("memdump <addr> <len>")?)?;
++                let len: usize = args.get(1).and_then(|w| parse_addr(w, 0)).ok_or("missing or bad length")?;
++                let len = len.min(256 << 20);
++                let b = self.mem.read(addr, len).ok_or_else(|| format!("{} unreadable", self.img(addr)))?;
++                let file = self.scan_file.with_file_name(format!("dump-{addr:x}.bin"));
++                std::fs::write(&file, &b).map_err(|e| e.to_string())?;
++                Ok(format!("memdump: {} bytes from {} to {}", b.len(), self.img(addr), file.display()))
++            }
+             "findptr" => {
+                 let lo = self.addr(args.first().ok_or("findptr <lo> <hi>")?)?;
+                 let hi = self.addr(args.get(1).ok_or("findptr <lo> <hi>")?)?;
+@@ -861,6 +923,13 @@ pub(crate) fn present(frame: u64) {
+             ch.replies.push(format!("[{stamp}] > {line}\n{reply}\n"));
+             continue;
+         }
++        // LOCAL (octo, inkVI-dive): `stages [<script>]`: the running mission's full stage list (crate::stagelist).
++        if words.first() == Some(&"stages") {
++            let reply = crate::stagelist::stages_text(&ch.exec.mem, &words[1..]);
++            tracing::info!(cmd = %line, ms = began.elapsed().as_millis(), "VICTORY_DEBUG: {}", reply.lines().next().unwrap_or(""));
++            ch.replies.push(format!("[{stamp}] > {line}\n{reply}\n"));
++            continue;
++        }
+         // LOCAL (octo, inkVI-dive): `checkpoint list` / `checkpoint <stage> ...` (crate::checkpoint).
+         if words.first() == Some(&"checkpoint") {
+             let reply = match &words[1..] {
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index 6766b7a..5f91919 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -31,6 +31,9 @@ mod debugcmd;
+ // LOCAL (octo, inkVI-dive): `checkpoint` (jump to a stage of the running mission) for the debug channel.
+ #[cfg(feature = "diagnostics")]
+ mod checkpoint;
++// LOCAL (octo, inkVI-dive): `stages`, the running mission's full stage list read from memory.
++#[cfg(feature = "diagnostics")]
++mod stagelist;
+ pub mod console;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod copystat;
+diff --git a/crates/victory-gpu/src/stagelist.rs b/crates/victory-gpu/src/stagelist.rs
+new file mode 100644
+index 0000000..d28c38c
+--- /dev/null
++++ b/crates/victory-gpu/src/stagelist.rs
+@@ -0,0 +1,484 @@
++//! LOCAL (octo, inkVI-dive): `stages`, the running mission's full stage list read from the title's memory,
++//! for the diagnostics build's debug channel (docs/checkpoints.md, "Stage list").
++//!
++//! How (build 1.0.2.1; found by searching memory for known stages in the Chapter 1 opening):
++//!  * the title keeps each stage of a mission as a small heap object of 32 bytes,
++//!    `{type: u64, stage hash: u32, 0: u32, pointer: u64, 0: u64}`, all of one type, and the mission's stage
++//!    list as a list object `{type, data, count: u32, capacity: u32}` whose `data` is an array object: a short
++//!    header ending in the element type, then `count` pointers to the stage objects, in play order;
++//!  * no stage hash is known in advance: the anchors are the stages the mission has registered so far
++//!    (`MISSION_STAGE_ADD`, the stage table of patch 0013). Their objects are found by shape, then every
++//!    array of pointers to objects of the same type that holds all anchors, then each array's list object;
++//!  * exactly one list (by content) with a list object whose count is the array's length, holding the anchors in
++//!    registration order, must be found, or none is used and the reply lists what was found. The type addresses
++//!    are heap addresses that change between runs: none is built in.
++//!    A second copy, 16-byte slots `{type, stage hash, 0}` in reverse order, is reported as a cross-check.
++//!    Our own search buffers (arrays of the very pointers looked for) are left out.
++
++use crate::debugcmd::Memory;
++use victory_loader::natives;
++
++/// What one search step finds at most (the rest is not looked at).
++const HITS_MAX: usize = 4096;
++/// The longest list followed (a mission with more stages is cut there and refused).
++const LEN_MAX: usize = 1024;
++/// Bytes read per piece of a region.
++const CHUNK: usize = 64 << 20;
++
++fn u64_at(b: &[u8], off: usize) -> Option<u64> {
++    b.get(off..off + 8).map(|c| u64::from_le_bytes(c.try_into().unwrap_or_default()))
++}
++
++fn qword<M: Memory>(mem: &M, at: usize) -> Option<u64> {
++    mem.read(at, 8).and_then(|b| u64_at(&b, 0))
++}
++
++/// A type pointer or a heap pointer: 8-byte aligned, above the first 64 KB, a user-space address.
++fn pointer_like(v: u64) -> bool {
++    v & 7 == 0 && (0x1_0000..0x8000_0000_0000).contains(&v)
++}
++
++/// A stage word: `{hash: u32 != 0, 0: u32}`.
++fn stage_word(v: u64) -> Option<u32> {
++    (v >> 32 == 0 && v != 0).then_some(v as u32)
++}
++
++/// Every 8-byte-aligned `at` whose qword is one of `wanted`, in the process's writable memory; `wanted` itself (our
++/// own buffer: an array of the very values looked for) is left out.
++fn find_qwords<M: Memory>(mem: &M, wanted: &[u64], mut keep: impl FnMut(usize, &[u8], usize) -> bool) -> usize {
++    let own = wanted.as_ptr() as usize..wanted.as_ptr() as usize + wanted.len() * 8;
++    let mut n = 0;
++    for r in mem.regions() {
++        let end = r.base + r.size;
++        let mut at = r.base;
++        while at < end && n < HITS_MAX {
++            let len = (end - at).min(CHUNK);
++            if let Some(b) = mem.read(at, len) {
++                let skip = at.wrapping_neg() & 7;
++                let mut off = skip;
++                while off + 8 <= b.len() {
++                    let v = u64::from_le_bytes(b[off..off + 8].try_into().unwrap_or_default());
++                    if wanted.contains(&v) && !own.contains(&(at + off)) && keep(at + off, &b, off) {
++                        n += 1;
++                        if n >= HITS_MAX {
++                            break;
++                        }
++                    }
++                    off += 8;
++                }
++            }
++            at += len;
++        }
++    }
++    n
++}
++
++/// A stage object: `{type, stage, 0, pointer, 0}` (32 bytes). Its (type, stage).
++fn stage_object<M: Memory>(mem: &M, at: usize) -> Option<(u64, u32)> {
++    let b = mem.read(at, 32)?;
++    let (ty, st, p, z) = (u64_at(&b, 0)?, u64_at(&b, 8)?, u64_at(&b, 16)?, u64_at(&b, 24)?);
++    (pointer_like(ty) && pointer_like(p) && z == 0).then_some(())?;
++    Some((ty, stage_word(st)?))
++}
++
++/// One list found.
++#[derive(Clone, Debug, PartialEq)]
++pub(crate) struct Found {
++    /// Where the list starts (the first pointer, or the first slot).
++    pub at: usize,
++    /// The type of its stage objects (or of its slots).
++    pub ty: u64,
++    /// The stages in memory order (an array: play order; slots: reverse play order).
++    pub stages: Vec<u32>,
++    /// An array's list object `{type, data, count, capacity}` whose count is the array's length.
++    pub header: Option<usize>,
++}
++
++/// What the search found for a set of anchors.
++#[derive(Clone, Debug, Default, PartialEq)]
++pub(crate) struct Search {
++    /// Stage objects of the anchors: (address, type, stage).
++    pub objects: Vec<(usize, u64, u32)>,
++    /// Arrays of pointers to stage objects of one type, holding every anchor.
++    pub arrays: Vec<Found>,
++    /// Runs of 16-byte slots `{type, stage, 0}` of one type, holding every anchor (a second copy).
++    pub slots: Vec<Found>,
++}
++
++/// Searches memory for the lists that hold every stage of `anchors`.
++pub(crate) fn search<M: Memory>(mem: &M, anchors: &[u32]) -> Search {
++    let mut s = Search::default();
++    if anchors.is_empty() {
++        return s;
++    }
++    let words: Vec<u64> = anchors.iter().map(|a| *a as u64).collect();
++    // 1. Every {type, anchor} pair: stage objects, and slots.
++    let mut pairs = Vec::new();
++    find_qwords(mem, &words, |at, b, off| {
++        let ty = if off >= 8 { u64_at(b, off - 8) } else { qword(mem, at - 8) };
++        match ty.filter(|t| pointer_like(*t)) {
++            Some(t) => {
++                pairs.push((at - 8, t));
++                true
++            }
++            None => false,
++        }
++    });
++    for &(at, ty) in &pairs {
++        if let Some((t, st)) = stage_object(mem, at) {
++            s.objects.push((at, t, st));
++        }
++        // Slots: walk to the first slot of the run, then read it forward.
++        let slot = |x: usize| mem.read(x, 16).and_then(|b| Some((u64_at(&b, 0)?, stage_word(u64_at(&b, 8)?)?)));
++        let mut first = at;
++        while at - first < LEN_MAX * 16 && slot(first - 16).is_some_and(|(t, _)| t == ty) {
++            first -= 16;
++        }
++        if s.slots.iter().any(|f| f.at == first) {
++            continue;
++        }
++        let mut stages = Vec::new();
++        let mut x = first;
++        while let Some((_, st)) = slot(x).filter(|(t, _)| *t == ty) {
++            stages.push(st);
++            x += 16;
++            if stages.len() >= LEN_MAX {
++                break;
++            }
++        }
++        if stages.len() >= 2 && anchors.iter().all(|a| stages.contains(a)) {
++            s.slots.push(Found { at: first, ty, stages, header: None });
++        }
++    }
++    // 2. Every array of pointers to stage objects of one type that holds all anchors.
++    let addrs: Vec<u64> = s.objects.iter().map(|o| o.0 as u64).collect();
++    if addrs.is_empty() {
++        return s;
++    }
++    let mut refs = Vec::new();
++    find_qwords(mem, &addrs, |at, _, _| {
++        refs.push(at);
++        true
++    });
++    for at in refs {
++        let ty = match qword(mem, at).and_then(|p| s.objects.iter().find(|o| o.0 as u64 == p)) {
++            Some(o) => o.1,
++            None => continue,
++        };
++        let elem = |x: usize| qword(mem, x).filter(|p| pointer_like(*p)).and_then(|p| stage_object(mem, p as usize)).filter(|(t, _)| *t == ty).map(|o| o.1);
++        let mut first = at;
++        while at - first < LEN_MAX * 8 && elem(first - 8).is_some() {
++            first -= 8;
++        }
++        if s.arrays.iter().any(|f| f.at == first) {
++            continue;
++        }
++        let mut stages = Vec::new();
++        let mut x = first;
++        while let Some(st) = elem(x) {
++            stages.push(st);
++            x += 8;
++            if stages.len() >= LEN_MAX {
++                break;
++            }
++        }
++        if anchors.iter().all(|a| stages.contains(a)) {
++            s.arrays.push(Found { at: first, ty, stages, header: None });
++        }
++    }
++    // 3. Each array's owner, a list object `{type, data, count: u32, capacity: u32}`: `data` is the array object,
++    //    whose elements begin a few qwords in (after its own header, the last qword of which is the element type),
++    //    and `count` is the number of stage pointers read.
++    let mut needles = Vec::new();
++    for f in &s.arrays {
++        if qword(mem, f.at - 8) == Some(f.ty) {
++            needles.extend((2..=8).map(|k| (f.at - 8 * k) as u64));
++        }
++    }
++    if !needles.is_empty() {
++        let mut owners = Vec::new();
++        find_qwords(mem, &needles, |at, _, _| {
++            owners.push(at);
++            true
++        });
++        for o in owners {
++            let (Some(data), Some(n)) = (qword(mem, o), qword(mem, o + 8)) else { continue };
++            let (count, cap) = (n as u32 as usize, (n >> 32) as usize);
++            if let Some(f) = s.arrays.iter_mut().find(|f| (f.at as u64).wrapping_sub(data) <= 0x40 && f.stages.len() == count && cap >= count) {
++                f.header.get_or_insert(o - 8);
++            }
++        }
++    }
++    s
++}
++
++/// The list to use: the one list (by content) of all arrays that have their list object (count = length) and hold
++/// the anchors in registration order. `Err` says why none is used.
++pub(crate) fn choose<'a>(s: &'a Search, anchors: &[u32]) -> Result<&'a Found, String> {
++    let ordered = |f: &&Found| {
++        let at: Vec<usize> = anchors.iter().filter_map(|a| f.stages.iter().position(|x| x == a)).collect();
++        at.windows(2).all(|w| w[0] < w[1])
++    };
++    let arrays: Vec<&Found> = s.arrays.iter().filter(|f| f.header.is_some()).filter(ordered).collect();
++    let mut lists: Vec<&Vec<u32>> = arrays.iter().map(|f| &f.stages).collect();
++    lists.sort();
++    lists.dedup();
++    match (lists.len(), arrays.first()) {
++        (1, Some(f)) => Ok(f),
++        (0, _) => Err(format!(
++            "no stage list found ({} stage objects of the {} registered stages, {} arrays of them, {} with a list object and the registered stages in order)",
++            s.objects.len(),
++            anchors.len(),
++            s.arrays.len(),
++            arrays.len()
++        )),
++        (n, _) => Err(format!("{n} different stage lists found, not one: none is used")),
++    }
++}
++
++/// The slot copy, if one run of slots holds the same list in reverse order.
++pub(crate) fn cross_check(s: &Search, list: &[u32]) -> Option<usize> {
++    s.slots.iter().find(|f| f.stages.iter().rev().eq(list.iter())).map(|f| f.at)
++}
++
++/// What was found, for a reply: every array and run, with its first stages.
++pub(crate) fn found_lines(s: &Search, max: usize) -> String {
++    let mut out = String::new();
++    let short = |v: &[u32]| {
++        let mut t: Vec<String> = v.iter().take(6).map(|h| format!("{h:#010x}")).collect();
++        if v.len() > 6 {
++            t.push("...".into());
++        }
++        t.join(" ")
++    };
++    for (at, ty, st) in s.objects.iter().take(max) {
++        out.push_str(&format!("\n  stage object {at:#x} type {ty:#x}: {st:#010x}"));
++    }
++    for f in s.arrays.iter().take(max) {
++        let head = f.header.map_or("no list object".to_string(), |h| format!("list object {h:#x}"));
++        out.push_str(&format!("\n  array {:#x} ({head}) of type {:#x} objects: {} stages: {}", f.at, f.ty, f.stages.len(), short(&f.stages)));
++    }
++    for f in s.slots.iter().take(max) {
++        out.push_str(&format!("\n  slots {:#x} type {:#x}: {} stages (memory order): {}", f.at, f.ty, f.stages.len(), short(&f.stages)));
++    }
++    out
++}
++
++/// Jumps tested to stages that are not among the Chapter 1 ten of `checkpoint::TEN` (found by this list).
++const TESTED_MORE: [u32; 2] = [0x835e_a26a, 0xc10a_e147];
++
++fn tested(h: u32) -> bool {
++    crate::checkpoint::TEN.iter().any(|k| k.0 == h && k.1) || TESTED_MORE.contains(&h)
++}
++
++/// Lists read before, per registering script: used when the list is not found again later.
++static READ: std::sync::Mutex<Vec<(u32, Vec<u32>, usize)>> = std::sync::Mutex::new(Vec::new());
++
++/// The full list of `table`'s mission: (stages in play order, where from), or why there is none.
++pub(crate) fn full_list<M: Memory>(mem: &M, table: &natives::StageTable) -> (Result<(Vec<u32>, String), String>, Search) {
++    let anchors: Vec<u32> = table.stages.iter().map(|s| s.stage).collect();
++    let s = search(mem, &anchors);
++    let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
++    let r = match choose(&s, &anchors) {
++        Ok(f) => {
++            let mut from = format!("read from memory: array {:#x}", f.at);
++            if let Some(h) = f.header {
++                from.push_str(&format!(" of list object {h:#x} (count {})", f.stages.len()));
++            }
++            if let Some(c) = cross_check(&s, &f.stages) {
++                from.push_str(&format!("; the reversed copy at {c:#x} agrees"));
++            }
++            read.retain(|r| r.0 != table.mission);
++            read.push((table.mission, f.stages.clone(), f.at));
++            Ok((f.stages.clone(), from))
++        }
++        Err(why) => match read.iter().find(|r| r.0 == table.mission && anchors.iter().all(|a| r.1.contains(a))) {
++            Some((_, list, at)) => Ok((list.clone(), format!("as read earlier from array {at:#x} (not found now: {why})"))),
++            None => Err(why),
++        },
++    };
++    (r, s)
++}
++
++/// The table to use: the given script's, or the one that registered last.
++pub(crate) fn table_of(script: Option<u32>) -> Result<natives::StageTable, String> {
++    let tables = natives::stage_tables();
++    if !natives::table_hooked() {
++        return Err("stage list: needs VICTORY_NATIVES=1 and MISSION_STAGE_ADD in the names file (its registered stages are the anchors)".into());
++    }
++    match script {
++        Some(m) => tables.into_iter().find(|t| t.mission == m).ok_or_else(|| format!("no stage table of script {m:#010x} (checkpoint list)")),
++        None => tables.into_iter().last().ok_or_else(|| "stage list: no mission has registered stages yet (needs a mission start)".into()),
++    }
++}
++
++/// `stages [<script>]`.
++pub(crate) fn stages_text<M: Memory>(mem: &M, args: &[&str]) -> String {
++    let script = match args.first() {
++        Some(w) => match w.strip_prefix("0x").and_then(|h| u32::from_str_radix(h, 16).ok()) {
++            Some(v) => Some(v),
++            None => return format!("error: {USAGE}"),
++        },
++        None => None,
++    };
++    let table = match table_of(script) {
++        Ok(t) => t,
++        Err(e) => return format!("error: {e}"),
++    };
++    let last = natives::stage_tables().last().map(|t| t.mission) == Some(table.mission);
++    let who = format!("script {:#010x}{}", table.mission, if last { " (registered last)" } else { "" });
++    let (r, s) = full_list(mem, &table);
++    match r {
++        Ok((list, from)) => {
++            let seen = natives::stages_seen();
++            let mut t = format!("stage list of {who}: {} stages in play order, {from}", list.len());
++            for (i, h) in list.iter().enumerate() {
++                let reg = table.stages.iter().any(|st| st.stage == *h);
++                t.push_str(&format!(
++                    "\n  #{} {}{}{}{}",
++                    i + 1,
++                    crate::checkpoint::name(*h),
++                    if reg { "  registered" } else { "" },
++                    if seen.contains(h) { "  announced" } else { "" },
++                    if tested(*h) { "  jump tested" } else { "" },
++                ));
++            }
++            t.push_str(&format!("\n({} of them registered so far; checkpoint #<n> counts in this list)", table.stages.len()));
++            t
++        }
++        Err(why) => {
++            let mut t = crate::checkpoint::table_text(&[table], true);
++            if !last {
++                t = t.replacen(" (registered last)", "", 1);
++            }
++            format!("stage list of {who}: {why}{}\nthe stages registered so far are used instead (checkpoint #<n> counts in them):\n{t}", found_lines(&s, 8))
++        }
++    }
++}
++
++/// `checkpoint #<n>`: the n-th stage of the running mission's full list, or of its registration table when the
++/// list is not found. (stage, what it was counted in).
++pub(crate) fn nth<M: Memory>(mem: &M, word: &str) -> Result<(u32, String), String> {
++    let n = word.strip_prefix('#').and_then(|n| n.parse::<usize>().ok()).filter(|n| *n > 0).ok_or_else(|| format!("bad stage number {word}"))?;
++    let table = table_of(None)?;
++    match full_list(mem, &table).0 {
++        Ok((list, from)) => {
++            let h = *list.get(n - 1).ok_or_else(|| format!("no stage {word}: the stage list has {} (stages)", list.len()))?;
++            Ok((h, format!("{word} of the stage list of script {:#010x} ({} stages, {from})", table.mission, list.len())))
++        }
++        Err(why) => {
++            let h = table.stages.get(n - 1).ok_or_else(|| format!("no stage {word}: the stage list was not found ({why}) and the table has {} (checkpoint list)", table.stages.len()))?.stage;
++            Ok((h, format!("{word} of the registration table of script {:#010x} (the stage list was not found: {why})", table.mission)))
++        }
++    }
++}
++
++pub(crate) const USAGE: &str = "stages [0x<script>] (the running mission's full stage list, from memory)";
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::debugcmd::Region;
++    use std::cell::RefCell;
++
++    /// Memory: 16 KB at 0x10000, read-write.
++    struct Page(RefCell<Vec<u8>>);
++    const AT: usize = 0x10000;
++    impl Memory for Page {
++        fn image_base(&self) -> usize {
++            0
++        }
++        fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
++            let p = self.0.borrow();
++            (addr >= AT && addr + len <= AT + p.len()).then(|| p[addr - AT..addr - AT + len].to_vec())
++        }
++        fn write(&self, addr: usize, bytes: &[u8]) -> bool {
++            let mut p = self.0.borrow_mut();
++            if addr < AT || addr + bytes.len() > AT + p.len() {
++                return false;
++            }
++            p[addr - AT..addr - AT + bytes.len()].copy_from_slice(bytes);
++            true
++        }
++        fn regions(&self) -> Vec<Region> {
++            vec![Region { base: AT, size: 0x4000, image: false }]
++        }
++    }
++    fn q(m: &Page, at: usize, v: u64) {
++        assert!(m.write(at, &v.to_le_bytes()));
++    }
++    const TY: u64 = 0x6_9baf_b440;
++    const SLOT: u64 = 0x6_9baf_ae68;
++    const LIST: [u32; 6] = [0xc4c1_cba4, 0x489b_8c77, 0x3382_4f3b, 0x7bf0_9c68, 0x8cf1_71f3, 0xc10a_e147];
++
++    /// The objects in two runs, out of order in memory; the array in play order (its element type just before it,
++    /// its list object at 0x2f00); the slots reversed.
++    fn mission(m: &Page) -> usize {
++        q(m, AT + 0x1ff8, TY);
++        q(m, AT + 0x2f00, 0x6_b917_5e20);
++        q(m, AT + 0x2f08, (AT + 0x2000 - 0x28) as u64);
++        q(m, AT + 0x2f10, 6 | 8 << 32);
++        let obj = |i: usize| AT + if i < 3 { 0x800 + i * 0x20 } else { 0x1000 + (5 - i) * 0x20 };
++        for (i, st) in LIST.iter().enumerate() {
++            q(m, obj(i), TY);
++            q(m, obj(i) + 8, *st as u64);
++            q(m, obj(i) + 16, 0x1_2c9e_9bf0);
++            q(m, obj(i) + 24, 0);
++            q(m, AT + 0x2000 + i * 8, obj(i) as u64);
++            q(m, AT + 0x3000 + (5 - i) * 16, SLOT);
++            q(m, AT + 0x3000 + (5 - i) * 16 + 8, *st as u64);
++        }
++        AT + 0x2000
++    }
++
++    #[test]
++    fn the_list_from_two_registered_stages() {
++        let m = Page(RefCell::new(vec![0u8; 0x4000]));
++        let arr = mission(&m);
++        // Another object pointing at the array with another count is not its list object.
++        q(&m, AT + 0x2f48, (arr - 0x28) as u64);
++        q(&m, AT + 0x2f50, 2 | 2 << 32);
++        let anchors = [0x489b_8c77, 0x3382_4f3b];
++        let s = search(&m, &anchors);
++        assert_eq!(s.objects.len(), 2, "{s:x?}");
++        assert_eq!(s.arrays.len(), 1, "{s:x?}");
++        let f = choose(&s, &anchors).unwrap();
++        assert_eq!((f.at, f.ty, f.stages.as_slice(), f.header), (arr, TY, &LIST[..], Some(AT + 0x2f00)));
++        assert_eq!(cross_check(&s, &f.stages), Some(AT + 0x3000));
++        // Registered in another order than the list: not used.
++        assert!(choose(&s, &[0x3382_4f3b, 0x489b_8c77]).is_err());
++        // A stage not in memory: nothing found.
++        assert!(choose(&search(&m, &[0x489b_8c77, 0x1234_5678]), &[0x489b_8c77, 0x1234_5678]).is_err());
++    }
++
++    #[test]
++    fn two_different_lists_are_refused() {
++        let m = Page(RefCell::new(vec![0u8; 0x4000]));
++        mission(&m);
++        let anchors = [0x489b_8c77, 0x3382_4f3b];
++        // A second array of the first three (another list holding both anchors), with no list object: not used.
++        q(&m, AT + 0x27f8, TY);
++        for k in 0..3 {
++            q(&m, AT + 0x2800 + k * 8, qword(&m, AT + 0x2000 + k * 8).unwrap());
++        }
++        let s = search(&m, &anchors);
++        assert_eq!(s.arrays.len(), 2, "{s:x?}");
++        assert_eq!(choose(&s, &anchors).map(|f| f.stages.len()), Ok(6));
++        assert!(found_lines(&s, 8).contains("array 0x12800 (no list object) of type 0x69bafb440 objects: 3 stages"), "{}", found_lines(&s, 8));
++        // With its list object (count 3): two different lists, none is used.
++        q(&m, AT + 0x2f80, 0x6_b917_5e20);
++        q(&m, AT + 0x2f88, (AT + 0x2800 - 0x28) as u64);
++        q(&m, AT + 0x2f90, 3 | 4 << 32);
++        let e = choose(&search(&m, &anchors), &anchors).unwrap_err();
++        assert!(e.contains("2 different stage lists"), "{e}");
++        // The same list twice is one list.
++        for k in 0..6 {
++            q(&m, AT + 0x2800 + k * 8, qword(&m, AT + 0x2000 + k * 8).unwrap());
++        }
++        q(&m, AT + 0x2f90, 6 | 6 << 32);
++        let s = search(&m, &anchors);
++        assert_eq!(s.arrays.iter().filter(|f| f.header.is_some()).count(), 2, "{s:x?}");
++        assert!(choose(&s, &anchors).is_ok());
++        assert!(found_lines(&s, 8).contains("6 stages: 0xc4c1cba4 0x489b8c77"));
++    }
++}
+-- 
+2.56.0
+

@@ -1,15 +1,17 @@
 # inkVI-dive
 
-Test tooling for VIctory: teleport, bookmarks, clock, cutscene replay and mission checkpoints from a command channel.
+Test tooling for VIctory: teleport, bookmarks, clock, cutscene replay and mission checkpoints from a command channel,
+and a switch that skips the intro videos.
 
 **A testing aid, work in progress.** It is for people who test VIctory builds and want to get the game to a place, a
 time of day or a cutscene without playing there. Tested on Linux under Proton with NVIDIA cards only (RTX 5090,
 RTX 5070 Ti), with the title's Xbox Series X build **1.0.2.1** on the Series X profile. It is not a script hook or a
 mod API: nothing is loaded into the game's scripts, and no command works on another build of the title.
 
-Source only: a pinned [inkVI](https://github.com/OctoAlgo/inkVI) version (v0.2.1), fourteen patches on top of it, a build
-script, a few small scripts and this README. Every tool is in the **diagnostics build** only and stays off unless its
-switch is set. GPL-3.0, like inkVI and victory-fork.
+Source only: a pinned [inkVI](https://github.com/OctoAlgo/inkVI) version (v0.2.1), fifteen patches on top of it (fourteen
+our own, one from other people: the movie skip, see Credits), a build script, a few small scripts and this README.
+Every tool is in the **diagnostics build** only and stays off unless its switch is set. The one exception is the movie
+skip (0015): it is in both builds, and off unless `VICTORY_SKIP_BINK` is set. GPL-3.0, like inkVI and victory-fork.
 
 ## What's in it
 
@@ -21,6 +23,7 @@ switch is set. GPL-3.0, like inkVI and victory-fork.
 | 0012 | `checkpoint`: jump to a stage (checkpoint) of the running mission, and a log line for every stage the title announces. Chapter 1 stages only so far; see [docs/checkpoints.md](docs/checkpoints.md). | `VICTORY_NATIVES=1` |
 | 0013 | The stage table: the stages a mission registers at its start, in order, with item counts; `checkpoint list` prints the running mission's table, the channel logs it, and `checkpoint #<n>` jumps to its n-th stage. See [docs/checkpoints.md](docs/checkpoints.md). | `VICTORY_NATIVES=1` |
 | 0014 | The stage list: `stages` reads the running mission's full stage list from memory, in play order, with no stage hash known in advance; `checkpoint #<n>` counts in it (the table of 0013 is the fallback). `memfind` / `memdump` for mining such structures. See [docs/checkpoints.md](docs/checkpoints.md), "Stage list". | `VICTORY_NATIVES=1` |
+| 0015 | Skips the title's Bink movies (logos, intro) when asked: a skipped movie is put on its last frame, so the title ends it at once. By C-GDev, ported by CuteBooty; code unchanged. See [docs/skip-bink.md](docs/skip-bink.md). | `VICTORY_SKIP_BINK=1` (`all`: the looping ones too) |
 | 0008-0011 | Captures for testing pictures: full-size frames, raw rows, a wall-clock window, a window after every start of a chosen cutscene, `cap [<n>]` from the channel, and captures when no swap chain can be made (headless second cards). | `VICTORY_CAPTURE_*` (below) |
 
 `patches/README.md` lists every patch with its files and licence.
@@ -44,6 +47,11 @@ paths, as the layer sees them; under Proton `Z:\` is the Linux root):
     VICTORY_NATIVES=1                                            # the natives hook
     VICTORY_NATIVES_NAMES='Z:\home\you\inkVI-dive\tools\natives-names.txt'
     VICTORY_DEBUG_BOOKMARKS='Z:\home\you\dive\bookmarks.txt'    # optional; tools/bookmarks.example.txt to start from
+    VICTORY_SKIP_BINK=1                                          # recommended for test runs: skips the logo and intro movies
+
+`VICTORY_SKIP_BINK` is off by default (unset or `0`). `1` skips the movies that play once (logos, the intro). `all`
+skips the looping ones too; then the menu backgrounds stay dark. We recommend `1` for test runs: it touches only the movies that
+play once, and from the start screen into the game took 21.3 s instead of 34.5 s in our runs. See [docs/skip-bink.md](docs/skip-bink.md).
 
 **Which Proton:** we run on Proton 11 with a patched wineserver that keeps memory views in a tree
 ([CachyOS/wine-cachyos PR #50](https://github.com/CachyOS/wine-cachyos/pull/50),
@@ -119,10 +127,13 @@ list from memory (24 stages in the Chapter 1 opening), so you can jump by number
 
 Limits, up front: jumps in Chapter 1 only (the list reads in the cell mission too, the jump does not); a stage in
 the list is not always a checkpoint; `stages` stops the game for 6-10 s while it searches; a mission must be running (one that fails by distance); the jump fails the
-mission on purpose; passing a mission, free roam and later chapters are not shown; a forward jump skips whatever the
-skipped stages would have set, so never keep playing on that save; the field's address differs by build (it is found
+mission on purpose; later chapters are not shown; a forward jump skips whatever the skipped stages would have set,
+so keep such saves apart from your real ones; the field's address differs by build (it is found
 fresh every time, and the command refuses if it does not find exactly one); the far teleport it uses crashed the
-title in 2 of 17 tries so far; a jump changes the stage, not what you carry; copies of saves only. Every stage the
+title in 2 of 17 tries so far; a jump changes the stage, not what you carry; copies of saves only. Shown once, in one hand-played
+session: after a jump to #24 of Chapter 1 the mission was finished, free roam was reached at Jason's house, and the
+title's manual save and autosave worked (shown in its own save menu). The way on to later missions is to chain them: jump to a mission's last stage, finish it, then `stages` in
+the next one. Whether the jump works in the next missions is not tested yet. Every stage the
 title announces is written to the channel's `log.txt`, so new stages can be recorded. Details, options and how it
 works: [docs/checkpoints.md](docs/checkpoints.md).
 
@@ -252,6 +263,8 @@ them: a `tp` streams the area in and holds the player until the ground is there.
 - `ncall` with a wrong argument count or a made-up pointer can crash the game, and `m+0x<rva>` with a wrong address
   or object will: it is a debugging tool. Use copies of saves; the commands change the game state.
 - `time` to an earlier hour moves the date one day on.
+- **Movie skip (0015):** only Bink exports bound at load are wrapped; one looked up with `GetProcAddress`, or a second
+  Bink DLL, is not skipped. `all` leaves the menu backgrounds dark. Not tested by us: `all`, the release build.
 
 ## Next
 
@@ -270,10 +283,14 @@ stages of more missions.
   knowledge; every hash, address and behaviour here was read from our own copy of the title and checked in the game.
 - Checkpoints (the study and the `checkpoint` command): octo / inkVI.
 - Capture receipts (`tools/capture-receipt.py`): TomTomAIbot (ThomasHFWright).
+- The movie skip (patch 0015, `VICTORY_SKIP_BINK`): written by C-GDev
+  ([fxceless/victory-fork PR #613](https://github.com/fxceless/victory-fork/pull/613), not merged there); ported to this
+  tree by CuteBooty ([trustno1-coder/VIctory-NVIDIA PR #26](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/26),
+  commit e31f4740), taken unchanged; the idea is from XCL PR #1053. GPL-3.0.
 
 ## What this kit ships, and what it does not
 
-Ships: fourteen patches (all our own, GPL-3.0), a build script, `tools/` (`dcmd.sh`, the trace readers `ntrace.py` and
+Ships: fifteen patches (fourteen our own, one by C-GDev and CuteBooty; all GPL-3.0), a build script, `tools/` (`dcmd.sh`, the trace readers `ntrace.py` and
 `nlogx.py`, `capture-receipt.py` and its test, `natives-names.txt`, `bookmarks.example.txt`), this README, `docs/`, a
 changelog and the licence.
 Does not ship: any binary, the title or any of its files, inkVI's or victory-fork's code (fetched at pinned commits by

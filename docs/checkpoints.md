@@ -20,10 +20,12 @@ Diagnostics build only, with `VICTORY_NATIVES=1` and the kit's `tools/natives-na
   teleport, so the jump does not work there yet.
 - **The jump fails the mission on purpose.** The title's own retry is what restarts the mission at the chosen stage.
   You see the fail, then the retry.
-- **Not shown:** passing a mission, starting the next one, free roam, any chapter after the first.
+- **Shown once, by hand:** after a jump to #24 of Chapter 1, the mission finished, free roam came, and the title's
+  saves worked ("Played by hand" below). **Not shown:** a jump in the next mission, any chapter after the first.
 - **Forward jumps skip story state.** Whatever the skipped stages would have set (objects, flags, things picked up)
   is not set. The stage plays from its start as the title restarts it, but the rest of the game may not match.
-  Never keep playing on a save that went through a forward jump.
+  Keep a save that went through a forward jump apart from your real ones: what the skipped stages would have set
+  was not checked, also not in the hand-played session below.
 - **Addresses differ by build.** The stage is kept in a field whose address changes with every build of the layer.
   `checkpoint` looks for it fresh every time and refuses when it does not find exactly one.
 - **No teleport after a retry for a while.** A teleport about 40 s after a retry once crashed the title inside its own
@@ -206,6 +208,20 @@ Once `checkpoint` (or `checkpoint list`) has found the field, every change of it
 `0x........ (no label)`. Please report them with the mission, the build and what the stage starts with.
 A hash that was announced this session can be used with `checkpoint 0x<hash>` while that mission runs; the jump
 itself is only proven for Chapter 1.
+
+## Played by hand (11-28), and the way on
+
+octo, on the RTX 5090, a copy of a save at the start of Chapter 1 ("Gone Fishing"), the v0.2.1 test build with
+`VICTORY_SKIP_BINK=1`: a jump to #24 of the stage list (`0xc10ae147`, the mission's last stage), then he played
+the end of the mission. The
+mission finished, and free roam came at Jason's house. A manual save and the autosave both worked; they showed in
+the title's own save menu. That is one session in one mission. The picture of this build is not the subject here
+(no ray tracing in this build).
+
+The way on to later missions is to **chain** them: jump to a mission's last stage, finish it, walk to the next
+mission, then `stages` and `checkpoint #<n>` there. Whether the jump works in the next missions is not tested yet.
+Starting any mission directly, without playing up to it, is an open question; see the issue linked in the v0.2.1
+release notes.
 
 ## Tested
 

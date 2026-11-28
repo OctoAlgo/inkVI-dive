@@ -1,7 +1,11 @@
 # Changelog
 
-## v0.2.1 - the stage list (on inkVI v0.2.1, fourteen patches)
+## v0.2.1 - the stage list and skipping the intro videos (on inkVI v0.2.1, fifteen patches)
 
+- Patch 0015 (not ours: written by C-GDev, fxceless/victory-fork PR #613, not merged there; ported by CuteBooty,
+  trustno1-coder/VIctory-NVIDIA PR #26, commit e31f4740; the idea from XCL PR #1053; taken unchanged, GPL-3.0):
+  `VICTORY_SKIP_BINK=1` skips the title's Bink movies that play once, `all` the looping ones too (menu backgrounds
+  stay dark). Off by default. The only patch of the kit that is in the release build too. docs/skip-bink.md.
 - Patch 0014: `stages` reads the running mission's full stage list from the title's memory, in play order. No
   stage hash has to be known: the stages the mission registered so far are the anchors. It uses a list only when
   it finds exactly one, else it says what it found. `checkpoint #<n>` counts in this list; the table of patch 0013
@@ -12,6 +16,16 @@
   channel's `log.txt` and the game log. `checkpoint list` prints the running mission's table. `checkpoint #<n>` jumps
   to the n-th stage of the table. The jump itself is unchanged. docs/checkpoints.md, "Stage table".
 - Names file: `MISSION_STAGE_ADD`, `MISSION_STAGE_ITEM`.
+
+Checked, movie skip: a clean-clone `build.sh` build (38 + 15 patches), its unit tests under Wine (bink 2, stagelist
+2, checkpoint 4: all pass), and three runs on the RTX 5070 Ti, headless (Linux, Proton 11, warm caches, Series X
+profile, a copy of a save at the start of Chapter 1). The intro movie plays after the start screen, not before it:
+launch to start screen about 7 s either way. Enter on the start screen to world frame 25: 34.5 s with
+`VICTORY_SKIP_BINK=0`, 21.3 s with `1` (one run each; one movie skipped, 450 frames). docs/skip-bink.md.
+
+Played by hand (RTX 5090, a copy of a save): a jump to #24, the last stage of the Chapter 1 opening; the mission
+finished, free roam came, and the title's manual save and autosave worked (shown in its own save menu).
+docs/checkpoints.md, "Played by hand".
 
 Checked, stage list: four scripted runs on the RTX 5090 (Linux, Proton 11, Series X profile, copies of saves), two
 of them on builds made with `build.sh` from a clean clone. Chapter 1: right after the mission start (2 stages

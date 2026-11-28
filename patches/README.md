@@ -1,8 +1,9 @@
 # The series
 
 Applied in this order by `../build.sh`, after inkVI's own series (pinned in `../BASE`). Each patch carries
-`Kit-Source:` and `Kit-Licence:` trailers. Everything is in the diagnostics build (`--features diagnostics`) and off
-unless its switch is set; the release build is unchanged.
+`Kit-Source:` and `Kit-Licence:` trailers; 0015 also `Kit-Credit:` lines. 0001-0014 are in the diagnostics build
+(`--features diagnostics`) only. 0015 is in both builds and off unless `VICTORY_SKIP_BINK` is set; unset, no import is
+bound differently.
 
 | # | patch | subject | switches | files | source | licence |
 |---|-------|---------|----------|-------|--------|---------|
@@ -20,6 +21,7 @@ unless its switch is set; the release build is unchanged.
 | 0012 | `0012-own-checkpoint.patch` | `checkpoint`: jump to a stage of the running mission; stage announcements in the channel's log | - (needs `VICTORY_NATIVES` and `MISSION_STAGE_SET` in the names file) | `crates/victory-gpu/src/{checkpoint.rs (new), debugcmd.rs, lib.rs}`, `crates/victory-loader/src/natives.rs` | own | GPL-3.0 |
 | 0013 | `0013-own-stage-table.patch` | the stage table: the stages a mission registers, in order; `checkpoint list` prints it; `checkpoint #<n>` | - (needs `VICTORY_NATIVES` and `MISSION_STAGE_ADD`, `MISSION_STAGE_ITEM` in the names file) | `crates/victory-gpu/src/{checkpoint.rs, debugcmd.rs}`, `crates/victory-loader/src/natives.rs` | own | GPL-3.0 |
 | 0014 | `0014-own-stage-list.patch` | `stages`: the running mission's full stage list read from memory; `checkpoint #<n>` counts in it; `memfind`, `memdump` | - (needs 0013's table) | `crates/victory-gpu/src/{stagelist.rs (new), checkpoint.rs, debugcmd.rs, lib.rs}` | own | GPL-3.0 |
+| 0015 | `0015-nvidia26-cutebooty-skip-bink.patch` | skip the title's Bink movies on request | `VICTORY_SKIP_BINK=1\|all` | `apps/victory/src/run.rs`, `crates/victory-hle/src/modules/{bink.rs (new), mod.rs}` | third party: trustno1-coder/VIctory-NVIDIA PR #26, commit e31f4740 (CuteBooty, git author kept), code unchanged; written by C-GDev (fxceless/victory-fork PR #613, 75fe122c, not merged there); idea from XCL PR #1053 | GPL-3.0 (the source repo's LICENSE) |
 
 Made against inkVI v0.2.1 (victory-fork `4c6046614` + inkVI's 38 patches). It uses inkVI's `hooks::write` (made
 `pub(crate)` by 0002), `iterate::world_frame` and the presenting thread's hook point next to `shot::present`.

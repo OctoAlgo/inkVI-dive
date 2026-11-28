@@ -57,6 +57,11 @@ and on none of the 54 others (black frames, the intro movie, the loading screen,
 flash. The 1920x1080 points are those of the full-size frame scaled down. Other sizes and aspects are not measured
 yet. A built-in version is planned for a later dive version.
 
+Until then, a simple way in: `VICTORY_SKIP_BINK=1 VICTORY_KEYS=r1/10:Enter` presses Enter every 10 presents from the
+first one until the world runs, so the start screen is passed without watching it. On an RTX 5090 that took 29.6 s
+from launch to world frame 25, in one run. It is a convenience, not a measured gain: in an earlier test on the
+RTX 5070 Ti, pressing that often from the first frame was not faster than the slower timer (`r300/30:Enter`).
+
 ## Tested
 
 Movie skip: a build made with `build.sh` from a clean clone (inkVI's 38 patches + these 15), its unit tests under

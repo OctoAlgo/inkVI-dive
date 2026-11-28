@@ -9,8 +9,13 @@ Diagnostics build only, with `VICTORY_NATIVES=1` and the kit's `tools/natives-na
 
 ## Limits first
 
-- **Chapter 1 stages only.** Four stages of the Chapter 1 opening mission are known (`checkpoint list`). Other
-  missions have stages too, but their hashes are not collected yet (see "Recording new stages").
+- **Chapter 1 stages only.** Ten stages of the Chapter 1 opening mission are known so far: four with labels
+  (`checkpoint list`) and six more found by playing, used by hash (table below). Other missions have stages too, but
+  their hashes are not collected yet (see "Recording new stages"). In another mission the command finds no stage
+  field and writes nothing.
+- **A jump changes the stage, not your state.** What you carry stays: after a jump back to a stage before a weapon is
+  handed over, you still have the weapon. A death in the game restarts at the last stage the title wrote, the same
+  way as the jump.
 - **A mission must be running**, and it must be one that fails when the player is teleported far away. The Chapter 1
   opening does (between 200 and 300 m). Others may not: the prison cell mission, for one, did not fail from a 3 km
   teleport, so the jump does not work there yet.
@@ -45,6 +50,20 @@ Diagnostics build only, with `VICTORY_NATIVES=1` and the kit's `tools/natives-na
 | ch1-s2 | `0x33824f3b` | from the montage |
 | ch1-s3 | `0x7bf09c68` | boat gameplay at the dock |
 | ch1-s4 | `0x8cf171f3` | in the boat on the river (control returned) |
+
+Found by playing on 11-28, in this order after ch1-s4 (no labels yet; use the hash, e.g. `checkpoint 0x27788afc`;
+what each one starts is left out to avoid spoilers):
+
+| order | hash | jump tested |
+|---|---|---|
+| 5 | `0x33202f8f` | yes |
+| 6 | `0xfa7c8d56` | |
+| 7 | `0x0fe610ad` | |
+| 8 | `0x27788afc` | yes (straight from the start of the mission) |
+| 9 | `0xf6787e02` | |
+| 10 | `0xd9ddaa4f` | |
+
+`0x4bb7a448` is announced between 8 and 9 but never written to the field, so it is not a checkpoint.
 
 `checkpoint list` prints these, any stage hash the title announced this session that has no label yet, the
 current stage read from the stage field, and the last stage the title announced.
@@ -112,7 +131,16 @@ Four runs of a clean-clone build of this branch, Linux, Proton 11 (memory-view-t
 | RTX 5090 | backward | ch1-s3 -> ch1-s2 | 1st run: the title crashed in its own teleport (the fail step). 2nd run: retry 16 s after at ch1-s2, as on the Ti |
 | RTX 5090 | forward | ch1-s3 -> ch1-s4 | retry 16 s after the teleport at ch1-s4; in the boat on the river, control returned |
 
+Then a hand-played session on the RTX 5090 (same build, `VICTORY_DT_MAX=0.2`):
+
+| from | to | result |
+|---|---|---|
+| start of the mission (ch1-s1) | ch1-s4 | the mission failed, retry at ch1-s4 |
+| start of the mission (ch1-s1) | `0x27788afc` | retry 14 s after the teleport at `0x27788afc` |
+| `0x27788afc` | `0x33202f8f` (back) | retry 21 s after the teleport; the weapon picked up later stayed |
+| prison cell (another mission) | `0x27788afc` | refused: no stage field found, nothing written |
+
 ## Credits
 
 The checkpoint study and the command: octo / inkVI. Capture receipts (used to share frames from such runs):
-TomTomAIbot.
+TomTomAIbot (ThomasHFWright).

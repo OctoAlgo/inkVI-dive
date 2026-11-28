@@ -106,7 +106,8 @@ Finding the natives behind something new: run with `log`, do the thing, `nlog`, 
 A test tool for reaching a mission stage quickly: `checkpoint <stage>` writes the stage into the field where the title
 keeps the running mission's current stage, makes the mission fail once with a far teleport, and lets the title's own
 retry restart the mission at that stage, with its own scenes, clock and placement. Backward and forward jumps work in
-the Chapter 1 opening (four known stages, `ch1-s1` .. `ch1-s4`); nothing else is shown yet.
+the Chapter 1 opening, also straight from the start of the mission (ten stages known so far: `ch1-s1` .. `ch1-s4`
+and six more by hash); nothing else is shown yet.
 
     DWAIT=300 tools/dcmd.sh <channel> "checkpoint list"
     DWAIT=300 tools/dcmd.sh <channel> "checkpoint ch1-s2"
@@ -115,7 +116,7 @@ Limits, up front: Chapter 1 stages only; a mission must be running (one that fai
 mission on purpose; passing a mission, free roam and later chapters are not shown; a forward jump skips whatever the
 skipped stages would have set, so never keep playing on that save; the field's address differs by build (it is found
 fresh every time, and the command refuses if it does not find exactly one); the far teleport it uses crashed the
-title in 2 of 17 tries so far; copies of saves only. Every stage the
+title in 2 of 17 tries so far; a jump changes the stage, not what you carry; copies of saves only. Every stage the
 title announces is written to the channel's `log.txt`, so new stages can be recorded. Details, options and how it
 works: [docs/checkpoints.md](docs/checkpoints.md).
 
@@ -248,7 +249,7 @@ them: a `tp` streams the area in and holds the player until the ground is there.
 
 ## Next
 
-Next: shareable test cases (stage, scene and capture window in one file, with receipts), a 'seconds until settled' measure for how long a scene takes to stream in after a cut, and stages beyond Chapter 1.
+Next: shareable test cases (save, stage, scene and capture window in one file, with receipts), automatic cutscene skipping to reach a test point fast, a one-key snapshot, a "seconds until settled" measure for streaming after a cut, and picture diffs between two builds.
 
 After that: a basic UI for the commands, an in-game menu or overlay, so the commands need no terminal.
 
@@ -262,7 +263,7 @@ stages of more missions.
 - The name hash (Jenkins one-at-a-time over lower-cased text) and the naming style of the script natives are community
   knowledge; every hash, address and behaviour here was read from our own copy of the title and checked in the game.
 - Checkpoints (the study and the `checkpoint` command): octo / inkVI.
-- Capture receipts (`tools/capture-receipt.py`): TomTomAIbot.
+- Capture receipts (`tools/capture-receipt.py`): TomTomAIbot (ThomasHFWright).
 
 ## What this kit ships, and what it does not
 

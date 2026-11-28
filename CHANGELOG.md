@@ -4,11 +4,13 @@
 
 - `checkpoint list` and `checkpoint <stage>` (patch 0012): jump to a stage of the running mission by writing the
   stage into the field the title keeps it in, failing the mission once with a far teleport and letting the title's
-  own retry restart it there. Chapter 1 stages only so far (`ch1-s1` .. `ch1-s4`). docs/checkpoints.md.
+  own retry restart it there. Works from the start of the mission too. Chapter 1 only: ten stages known so far
+  (`ch1-s1` .. `ch1-s4` plus six by hash, found by playing). A jump changes the stage, not what you carry.
+  docs/checkpoints.md.
 - The channel's `log.txt` gets a line for every stage the title announces (and every change of the stage field once
   it is known), so new stages can be recorded.
 - Names file: `MISSION_STAGE_SET`, the native the title announces stages with.
-- Capture receipts (`tools/capture-receipt.py`, by TomTomAIbot, PR #1) are part of this version.
+- Capture receipts (`tools/capture-receipt.py`, by TomTomAIbot (ThomasHFWright), PR #1) are part of this version.
 - New: a worked example, [A study on "clown vomit" (user-coined term)](docs/case-study-clown-vomit.md): how to use
   dive to catch a picture fault that only shows sometimes.
 

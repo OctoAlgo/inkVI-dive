@@ -36,7 +36,8 @@ profile), Linux under Proton, NVIDIA cards.
 
 octo, RTX 5090, a copy of a save at the start of Chapter 1 ("Gone Fishing"), this version with
 `VICTORY_SKIP_BINK=1`: a jump to #24, the mission's last stage. He played the end of the mission. The mission
-finished, and free roam came at Jason's house. A manual save and the autosave both worked; they showed in the
+finished, and free roam came at Jason's house, at 1.3 to 2.3 fps on the RTX 5090 with our usual picture faults (no RT
+in this build): it is reachable, not yet playable. A manual save and the autosave both worked; they showed in the
 title's own save menu. One session, one mission.
 
 **The way on: chain missions.** Jump to a mission's last stage, finish it, walk to the next mission, then `stages`
@@ -49,7 +50,7 @@ lead that works yet. If you want to look into it, see [issue #ISSUE_NUMBER](http
 
 `VICTORY_KEYS=r1/10:Enter` presses Enter every 10 presents from the first one until the world runs. On an RTX 5090
 it passed the start screen 5.2 s after launch, the same moment as pressing A by hand as soon as the screen showed
-(5.2 s). A timer that starts later (`r300/30:Enter`) left the start screen waiting about 9 s more. With
+(5.2 s). A timer that starts later (`r300/30:Enter`) passed it at 14.2 s. With
 `VICTORY_SKIP_BINK=1` too, the world ran 29.6 s after launch. One run each.
 
 ## Tested

@@ -81,6 +81,43 @@ then `checkpoint done: the title retried the mission ... at ch1-s2 ... the field
 - `slot=<addr>` use this field instead of looking (only if you checked it with `checkpoint list` / `peek`).
 - `force` teleport even though the clock stands still (see Limits).
 
+## Stage table
+
+Since v0.2.1 the hook also records stage tables. The title registers a mission's stages one by one through a native
+(`MISSION_STAGE_ADD`, in the names file) and asks for the items of each stage through another (`MISSION_STAGE_ITEM`).
+The hook keeps, per registering script (a mission, or a helper script of it), the stages in the order they were
+registered, with how many items were asked for under each and how many times the stage was registered.
+`checkpoint list` prints all tables after the known stages; the script that registered last comes last:
+
+    stage table of script 0x72e73a29 (registered last): 4 stages in the order the title registered them
+      #1 ch1-s1 (0x489b8c77)  items 0  registered 1x
+      #2 ch1-s2 (0x33824f3b)  items 24  registered 2x  jump tested
+
+The channel's `log.txt` (and the game log) get one line per registered stage and, when the registrations pause for
+3 s, one summary line:
+
+    [present .. world ..] stage table 0x72e73a29 #3: ch1-s3 (0x7bf09c68)
+    [present .. world ..] stage table 0x72e73a29: 3 stages: 0x489b8c77 0x33824f3b 0x7bf09c68 (items 0,24,16)
+
+`checkpoint #<n>` jumps to the n-th stage of the table that registered last (the same jump as with the hash; the same
+limits).
+
+**The table is not the whole mission.** In the Chapter 1 opening the title registers the stages as the mission
+reaches them, not all at its start: two at the start (ch1-s1, ch1-s2), one more on entering ch1-s3 (ch1-s2 is
+registered again then), the next on entering ch1-s4. So the table lists the stages registered so far, and a tester
+cannot read the later stages from it before they were reached. Reaching a stage once, or jumping to it by hash,
+adds it. Other notes:
+
+- A stage can be registered and never be written to the stage field (see `0x4bb7a448` above): the table is not a
+  list of checkpoints. "Jump tested" is shown only for the Chapter 1 ten and only where a jump was run.
+- "Items" counts the distinct keys the title asked for under the stage so far; what they are is not known. It grows
+  while the stage plays (ch1-s4: 4 on entering, 28 after the retry). Take it as a size hint only.
+- `registered 2x`: registered again, after a retry or on entering the next stage.
+- Several scripts register: in the prologue (the cell mission) four scripts did (see Tested). The mission is the
+  one whose hash the title's mission native returns; that native is not hooked, so the table is by script and the
+  mission is told by its hash from the known list.
+- Needs `VICTORY_NATIVES=1` and the two names in `tools/natives-names.txt`.
+
 ## How it works
 
 The title keeps the running mission's current stage as two 4-byte words, `{stage hash, 1}`, in a field of a
@@ -139,6 +176,17 @@ Then a hand-played session on the RTX 5090 (same build, `VICTORY_DT_MAX=0.2`):
 | start of the mission (ch1-s1) | `0x27788afc` | retry 14 s after the teleport at `0x27788afc` |
 | `0x27788afc` | `0x33202f8f` (back) | retry 21 s after the teleport; the weapon picked up later stayed |
 | prison cell (another mission) | `0x27788afc` | refused: no stage field found, nothing written |
+
+## Tested, stage table (v0.2.1)
+
+RTX 5070 Ti, Linux, Proton 11, copies of saves, same setup as above, Enter held through cutscenes.
+
+| card | save | what | result |
+|---|---|---|---|
+| RTX 5070 Ti | start of Chapter 1 | table at mission start | 2 stages at the start (ch1-s1, ch1-s2; items 0, 24); ch1-s3 added on entering it (ch1-s2 registered again), ch1-s4 on entering it. The same in both runs |
+| RTX 5070 Ti | start of Chapter 1 | `checkpoint #4` from ch1-s3 | `#4` resolved to ch1-s4; the title retried the mission 14 s after the teleport at ch1-s4, as with the hash (2 runs, the first on an earlier build of this patch with older label text). ch1-s4 was then registered again, items 4 -> 28. No crash |
+| RTX 5070 Ti | prologue (the cell mission) | tables | mission `0xb5ddd565` registered 2 stages (`0x08f2445f`, `0x2ed3a984`, items 0); helper scripts registered `0x36e7f7bd` 7 stages, `0xcbc14f15` 2, `0x889f3695` 1. The mission stayed in its first scene for 8 min (Enter held), so no later stage was reached |
+| not tested | restart mission from the pause menu | not reached (no menu driver); a retry registers again (`registered 2x`) |
 
 ## Credits
 

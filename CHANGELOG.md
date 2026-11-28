@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.2.1 - the stage table (on inkVI v0.2.1, thirteen patches)
+
+- Patch 0013: the hook records the stages a mission registers at its start (`MISSION_STAGE_ADD`), in registration
+  order, with a count of items per stage (`MISSION_STAGE_ITEM`). One line per stage and a summary line go to the
+  channel's `log.txt` and the game log. `checkpoint list` prints the running mission's table. `checkpoint #<n>` jumps
+  to the n-th stage of the table. The jump itself is unchanged. docs/checkpoints.md, "Stage table".
+- Names file: `MISSION_STAGE_ADD`, `MISSION_STAGE_ITEM`.
+
+Checked: three scripted runs on the RTX 5070 Ti (Linux, Proton 11, Series X profile, copies of saves, no picture):
+two from the start of Chapter 1 (table built as the stages are reached; `checkpoint #4` from ch1-s3 lands on ch1-s4
+both times) and one in the prologue (the cell mission: four registering scripts). Not run on the RTX 5090 for this
+version. docs/checkpoints.md, "Tested, stage table".
+
 ## v0.2 - checkpoints (on inkVI v0.2.1, twelve patches)
 
 - `checkpoint list` and `checkpoint <stage>` (patch 0012): jump to a stage of the running mission by writing the

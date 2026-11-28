@@ -7,7 +7,7 @@ time of day or a cutscene without playing there. Tested on Linux under Proton wi
 RTX 5070 Ti), with the title's Xbox Series X build **1.0.2.1** on the Series X profile. It is not a script hook or a
 mod API: nothing is loaded into the game's scripts, and no command works on another build of the title.
 
-Source only: a pinned [inkVI](https://github.com/OctoAlgo/inkVI) version (v0.2.1), twelve patches on top of it, a build
+Source only: a pinned [inkVI](https://github.com/OctoAlgo/inkVI) version (v0.2.1), thirteen patches on top of it, a build
 script, a few small scripts and this README. Every tool is in the **diagnostics build** only and stays off unless its
 switch is set. GPL-3.0, like inkVI and victory-fork.
 
@@ -19,6 +19,7 @@ switch is set. GPL-3.0, like inkVI and victory-fork.
 | 0002-0006 | The title's script natives from the channel: the layer hooks the call the title's script interpreter makes for every native, and runs queued calls on a script thread, where the title calls them itself. On top: `pos`, `tp`, `time`, `date`, bookmarks, cutscenes (`scene ...`), any native by name or hash (`ncall`), a trace of what the scripts call. | `VICTORY_NATIVES=1` (`trace`, `log` for the traces) |
 | 0007 | The two hook sites found by byte pattern (each must occur exactly once in the executable's code), not by fixed address. | - |
 | 0012 | `checkpoint`: jump to a stage (checkpoint) of the running mission, and a log line for every stage the title announces. Chapter 1 stages only so far; see [docs/checkpoints.md](docs/checkpoints.md). | `VICTORY_NATIVES=1` |
+| 0013 | The stage table: the stages a mission registers at its start, in order, with item counts; `checkpoint list` prints the running mission's table, the channel logs it, and `checkpoint #<n>` jumps to its n-th stage. See [docs/checkpoints.md](docs/checkpoints.md). | `VICTORY_NATIVES=1` |
 | 0008-0011 | Captures for testing pictures: full-size frames, raw rows, a wall-clock window, a window after every start of a chosen cutscene, `cap [<n>]` from the channel, and captures when no swap chain can be made (headless second cards). | `VICTORY_CAPTURE_*` (below) |
 
 `patches/README.md` lists every patch with its files and licence.
@@ -78,7 +79,7 @@ Checked in the game (build 1.0.2.1, Series X profile). The last line of each rep
 | `scene ...` | cutscenes, see below | |
 | `cap [<n>]` | save the next n frames (needs `VICTORY_CAPTURE`) | `cap: presents 1873..1874 are saved` |
 | `ncall <NAME\|0x<hash>\|+0x<rva>\|m+0x<rva>> [ret=<n>] [><var>] [wait=<secs>] [<arg>...]` | any native or script-class method | `#310 SET_CLOCK_TIME ... 9 15 30 -> ret [0x0]` |
-| `checkpoint list` / `checkpoint <stage>` | the known mission stages and the current one / jump to a stage of the running mission (see Checkpoints) | `checkpoint done: the title retried the mission 21 s after the teleport at ch1-s2 (0x33824f3b) ...` |
+| `checkpoint list` / `checkpoint <stage or #n>` | the known mission stages, the running mission's stage table and the current stage / jump to a stage of the running mission (see Checkpoints) | `checkpoint done: the title retried the mission 21 s after the teleport at ch1-s2 (0x33824f3b) ...` |
 | `nstat`, `nfind`, `nscript`, `ntrace`, `nmark`, `nwatch`, `ndump`, `nlog`, `nhelp` | the hook's state, which script runs queued calls, traces | |
 | `peek`, `peekf`, `poke`, `pokef`, `base`, `help` | raw memory (no natives needed) | |
 
@@ -267,7 +268,7 @@ stages of more missions.
 
 ## What this kit ships, and what it does not
 
-Ships: twelve patches (all our own, GPL-3.0), a build script, `tools/` (`dcmd.sh`, the trace readers `ntrace.py` and
+Ships: thirteen patches (all our own, GPL-3.0), a build script, `tools/` (`dcmd.sh`, the trace readers `ntrace.py` and
 `nlogx.py`, `capture-receipt.py` and its test, `natives-names.txt`, `bookmarks.example.txt`), this README, `docs/`, a
 changelog and the licence.
 Does not ship: any binary, the title or any of its files, inkVI's or victory-fork's code (fetched at pinned commits by
